@@ -1,15 +1,15 @@
 import pandas as pd, numpy as np, os, gc, zipfile, re, warnings
 import gdown
-from .config import *
+from src import config
 
 warnings.filterwarnings('ignore')
 
 def download_and_extract():
-    if not os.path.exists('data.zip'):
-        gdown.download('https://drive.google.com/uc?id=1resyBioT2TJTZdLVfuEZdk8PvJAbK5GM', 'data.zip', quiet=False)
-    if not os.path.exists(PASS_CSV):
-        with zipfile.ZipFile(RAW_ZIP, 'r') as z: z.extractall(DATA_DIR)
-        with zipfile.ZipFile(METRO_ZIP, 'r') as z: z.extractall(DATA_DIR)
+    if not os.path.exists(config.RAW_ZIP):
+        gdown.download('https://drive.google.com/uc?id=1resyBioT2TJTZdLVfuEZdk8PvJAbK5GM', config.RAW_ZIP, quiet=False)
+    if not os.path.exists(config.PASS_CSV):
+        with zipfile.ZipFile(config.RAW_ZIP, 'r') as z: z.extractall(config.DATA_DIR)
+        with zipfile.ZipFile(config.METRO_ZIP, 'r') as z: z.extractall(config.DATA_DIR)
 
 def load_references():
     ref_places = pd.read_csv(os.path.join(config.DATA_DIR, 'REF_PSG_PLACES_202503251822.csv'), sep=';')
@@ -18,7 +18,8 @@ def load_references():
     gds_goods = pd.read_csv(os.path.join(config.DATA_DIR, 'GDS_GOODS_202503251844.csv'), sep=';')
     
     rows = []
-    with open(f'{DATA_DIR}V_PCR_CONTRACTOR_202503251702.csv', 'r', encoding='utf-8') as f:
+    pcr_path = os.path.join(config.DATA_DIR, 'V_PCR_CONTRACTOR_202503251702.csv')
+    with open(pcr_path, 'r', encoding='utf-8') as f:
         for line in f:
             for m in re.findall(r'(\d+);;([^0-9]+?)(?=\d+;;|$)', line):
                 rows.append({'ID': int(m[0]), 'PARENT_ID': None, 'NAME_SHORT': m[1].strip()})
@@ -26,7 +27,7 @@ def load_references():
     return ref_places, ref_transport, ref_routes, gds_goods, pcr_contr
 
 def create_hourly_parquet():
-    if os.path.exists(HOURLY_PARQUET):
+    if os.path.exists(config.HOURLY_PARQUET):
         print("hourly.parquet уже существует. Пропуск агрегации.")
         return
     
@@ -42,7 +43,7 @@ def create_hourly_parquet():
 
     CHUNK = 3_000_000
     agg_parts, n_total = [], 0
-    reader = pd.read_csv(PASS_CSV, sep=';', usecols=USE_COLS, parse_dates=['TRAN_DATE'], chunksize=CHUNK, low_memory=False)
+    reader = pd.read_csv(config.PASS_CSV, sep=';', usecols=USE_COLS, parse_dates=['TRAN_DATE'], chunksize=CHUNK, low_memory=False)
 
     for i, ch in enumerate(reader):
         n_total += len(ch)
@@ -78,8 +79,11 @@ def create_hourly_parquet():
     hourly['is_wknd'] = (hourly['dow'] >= 5).astype(int)
     
     hourly['md'] = list(zip(hourly['date_hour'].dt.month, hourly['date_hour'].dt.day))
-    hourly['is_hol'] = hourly['md'].isin(HOLIDAYS_MD).astype(int)
+    hourly['is_hol'] = hourly['md'].isin(config.HOLIDAYS_MD).astype(int)
     hourly.drop('md', axis=1, inplace=True)
 
-    hourly.to_parquet(HOURLY_PARQUET, index=False)
-    print(f"Сохранено: {HOURLY_PARQUET} ({len(hourly):,} строк)")
+    # Создаем папку, если ее нет
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    
+    hourly.to_parquet(config.HOURLY_PARQUET, index=False)
+    print(f"Сохранено: {config.HOURLY_PARQUET} ({len(hourly):,} строк)")
