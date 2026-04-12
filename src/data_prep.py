@@ -12,10 +12,10 @@ def download_and_extract():
         with zipfile.ZipFile(METRO_ZIP, 'r') as z: z.extractall(DATA_DIR)
 
 def load_references():
-    ref_places = pd.read_csv(f'{DATA_DIR}REF_PSG_PLACES_202503251822.csv', sep=';')
-    ref_transport = pd.read_csv(f'{DATA_DIR}REF_TRANSPORT_TYPE_202503251727.csv', sep=';')
-    ref_routes = pd.read_csv(f'{DATA_DIR}REF_TRANSPORT_WAY_202503251803.csv', sep=';')
-    gds_goods = pd.read_csv(f'{DATA_DIR}GDS_GOODS_202503251844.csv', sep=';')
+    ref_places = pd.read_csv(os.path.join(config.DATA_DIR, 'REF_PSG_PLACES_202503251822.csv'), sep=';')
+    ref_transport = pd.read_csv(os.path.join(config.DATA_DIR, 'REF_TRANSPORT_TYPE_202503251727.csv'), sep=';')
+    ref_routes = pd.read_csv(os.path.join(config.DATA_DIR, 'REF_TRANSPORT_WAY_202503251803.csv'), sep=';')
+    gds_goods = pd.read_csv(os.path.join(config.DATA_DIR, 'GDS_GOODS_202503251844.csv'), sep=';')
     
     rows = []
     with open(f'{DATA_DIR}V_PCR_CONTRACTOR_202503251702.csv', 'r', encoding='utf-8') as f:
