@@ -158,16 +158,21 @@ def final_validation(df_full, pivot_df):
     synth_start_idx = len(pivot_df)
     synth_data = df_full[pivot_df.columns].iloc[synth_start_idx:synth_start_idx+168]
     
+    # 1) Временная структура
     real_acf = acf(pivot_df.mean(axis=1).values, nlags=48, fft=True)[1:25]
     synth_acf = acf(synth_data.mean(axis=1).values, nlags=48, fft=True)[1:25]
     metrics['acf_similarity'] = 1 - np.mean(np.abs(real_acf - synth_acf))
     
+    # 2) Профиль по часам
     real_profile = pivot_df.groupby(pivot_df.index.hour).mean().mean(axis=1)
     synth_profile = synth_data.groupby(synth_data.index.hour).mean().mean(axis=1)
     metrics['profile_corr'] = real_profile.corr(synth_profile)
     
-    real_q = np.quantile(pivot_df.values.ravel(), [0.01, 0.5, 0.99])
-    synth_q = np.quantile(synth_data.values.ravel(), [0.01, 0.5, 0.99])
+    real_vals = pivot_df.values.ravel()
+    synth_vals = synth_data.values.ravel()
+    # Убираем нули (ночь/простой), чтобы они не обнуляли отношение квантилей
+    real_q = np.quantile(real_vals[real_vals > 0], [0.25, 0.5, 0.99])
+    synth_q = np.quantile(synth_vals[synth_vals > 0], [0.25, 0.5, 0.99])
     metrics['quantile_ratio'] = np.mean(synth_q / (real_q + 1e-6))
     
     corr_synth = np.corrcoef(synth_data.T)
@@ -181,7 +186,6 @@ def final_validation(df_full, pivot_df):
         metrics['corr_std'] > 0.01
     )
     return metrics
-
 def save_generation_config(seed, gen_days, validation_passed):
     """Сохраняет конфигурацию запуска."""
     cfg = {
