@@ -5,7 +5,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KNeighborsRegressor
 from datetime import timedelta
-from src.config import HOLIDAYS_MD
+from .config import HOLIDAYS_MD
 
 def metrics(yt, yp, name=""):
     yt, yp = np.array(yt, float), np.array(yp, float)
