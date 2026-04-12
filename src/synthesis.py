@@ -6,6 +6,10 @@ from scipy.interpolate import CubicSpline
 from statsmodels.tsa.stattools import acf
 from src import config
 
+def clean_id(v):
+    s = str(v)
+    return s[:-2] if s.endswith('.0') else s
+
 def generate_global_warp(n_hours=24, n_knots=4, sigma=0.06):
     x = np.linspace(0, n_hours - 1, n_knots)
     y = np.random.normal(1.0, sigma, size=n_knots)
@@ -37,7 +41,17 @@ def load_clusters_mapping():
     if not os.path.exists(config.CLUSTERS_CSV):
         print("ВНИМАНИЕ: final_clusters.csv не найден. Локальный варпинг отключен.")
         return {}
+    
     clusters_df = pd.read_csv(config.CLUSTERS_CSV)
+    
+    def format_oid(row):
+        oid = clean_id(row['object_id'])
+        if row['transport'] == 'НГПТ':
+            return f"RT_{oid}"
+        else: # Метро, МЦД, Другое
+            return f"ST_{oid}"
+            
+    clusters_df['object_id_str'] = clusters_df.apply(format_oid, axis=1)
     return dict(zip(clusters_df['object_id_str'], clusters_df['cluster']))
 
 def run_synthesis(pivot_df, gen_days=60, seed=42):
@@ -50,7 +64,7 @@ def run_synthesis(pivot_df, gen_days=60, seed=42):
     
     missing_in_clusters = set(top_objects) - set(obj_to_cluster.keys())
     if missing_in_clusters:
-        print(f"⚠️ {len(missing_in_clusters)} объектов из топ-1500 не найдены в clusters.csv.")
+        print(f"!!!{len(missing_in_clusters)} объектов из топ-1500 не найдены в clusters.csv.")
     
     day_blocks = build_day_blocks(pivot_df)
     last_real_date = pivot_df.index[-1]
