@@ -1,6 +1,6 @@
 import pandas as pd, numpy as np, os, gc, zipfile, re, warnings
 import gdown
-from src.config import *
+from .config import *
 
 warnings.filterwarnings('ignore')
 
