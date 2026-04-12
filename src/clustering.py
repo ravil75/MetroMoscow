@@ -2,7 +2,7 @@ import pandas as pd, numpy as np, warnings
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
-from src.config import *
+from .config import *
 
 warnings.filterwarnings('ignore')
 
