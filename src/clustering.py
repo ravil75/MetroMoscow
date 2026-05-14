@@ -1,10 +1,14 @@
-import pandas as pd, numpy as np, warnings
+import pandas as pd, numpy as np, os, warnings
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from .config import *
 
 warnings.filterwarnings('ignore')
+
+def clean_id(v):
+    s = str(v)
+    return s[:-2] if s.endswith('.0') else s
 
 def build_profiles(subset, id_col, name_col):
     subset = subset.copy()
@@ -40,10 +44,14 @@ def build_profiles(subset, id_col, name_col):
         rows.append(r)
     return pd.DataFrame(rows)
 
-def run_clustering():
-    if os.path.exists(CLUSTERS_CSV):
+def run_clustering(force_regenerate=False):
+    # Проверяем, нужно ли пропускать
+    if not force_regenerate and os.path.exists(CLUSTERS_CSV):
         print("final_clusters.csv уже существует. Пропуск.")
         return
+
+    # Убеждаемся, что папка существует
+    os.makedirs(os.path.dirname(CLUSTERS_CSV), exist_ok=True)
 
     hourly = pd.read_parquet(HOURLY_PARQUET)
     
@@ -116,8 +124,19 @@ def run_clustering():
         cluster_names[c] = nm
 
     af['cluster_name'] = af.cluster.map(cluster_names)
-    save_cols = ['object_id','object_name','transport','cluster','cluster_name',
-                 'LN_CODE','LN_NAME','daily_volume','log_volume',
-                 'morn_eve_ratio','we_wd_ratio','peakiness','night_share','midday_share']
+    
+    # НОВОЕ:  строковый ID с префиксом (ST_ / RT_)
+    def format_oid(row):
+        oid = clean_id(row['object_id'])
+        if row['transport'] == 'НГПТ': return f"RT_{oid}"
+        else: return f"ST_{oid}"
+        
+    af['object_id_str'] = af.apply(format_oid, axis=1)
+
+    # НОВОЕ: 'object_id_str' в список сохранения
+    save_cols = ['object_id', 'object_id_str', 'object_name', 'transport', 'cluster', 'cluster_name',
+                 'LN_CODE', 'LN_NAME', 'daily_volume', 'log_volume',
+                 'morn_eve_ratio', 'we_wd_ratio', 'peakiness', 'night_share', 'midday_share']
+    
     af[save_cols].to_csv(CLUSTERS_CSV, index=False)
-    print(f"Сохранено: {CLUSTERS_CSV} (кластеров: {af.cluster.nunique()})")
+    print(f"✅ Сохранено: {CLUSTERS_CSV} (кластеров: {af.cluster.nunique()})")
