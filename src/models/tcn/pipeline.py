@@ -417,9 +417,11 @@ def predict_tcn(model, train_real, target_index, scales, cfg):
             future_cov = future_cov.to(device=device, dtype=torch.float32)
             pred_scaled = model(x_seq, future_cov).cpu().numpy().reshape(-1)
             # Клиппинг в лог-пространстве чтобы избежать взрывных предсказаний
-            raw = np.clip(pred_scaled * np.log1p(scales[object_id]), -10, 10)
-            pred = np.expm1(raw)
+            scale_log = np.log1p(scales[object_id])
+            pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_log)
+            pred = np.minimum(pred, scales[object_id] * 10)  # не более 10× среднего
             predictions[object_id] = np.maximum(pred, 0.0)
+
     return predictions
 
 
@@ -492,8 +494,9 @@ def predict_tcn_batch(model, history_frame, target_index, scales, cfg, batch_siz
             )
             pred_scaled = model(x_batch, cov_batch).cpu().numpy()
             # Клиппинг в лог-пространстве — убирает взрывной WAPE
-            raw = np.clip(pred_scaled * scale_logs[start:stop], -10, 10)
-            pred = np.expm1(raw)
+            pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_logs[start:stop])
+            max_pred = np.expm1(scale_logs[start:stop]) * 10  # expm1(log1p(scale)) = scale
+            pred = np.minimum(pred, max_pred)
             preds.append(np.maximum(pred, 0.0))
 
     pred_matrix = np.vstack(preds)
