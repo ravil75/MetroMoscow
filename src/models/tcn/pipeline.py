@@ -6,11 +6,14 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from pathlib import Path
+import os
 
 from ...backtest import make_rolling_folds, summarize_results
 from ...baseline_models import forecast_metrics
 from ...synthesis import synthesize_from_train, validate_synthetic, get_synth_days
 from ...windowing import make_time_covariates
+from ... import config
 
 
 def set_seed(seed):
@@ -35,6 +38,45 @@ def compute_object_scales(train_real):
         scales[object_id] = max(scale, 1.0)
     return scales
 
+
+def save_tcn_checkpoint(model, scales, cfg, filepath):
+    """Сохраняет веса модели, скейлеры и конфигурацию для будущего инференса."""
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "scales": scales,
+        "cfg": cfg.__dict__,
+        # Сохраняем архитектурные параметры, необходимые для инициализации
+        "input_channels": model.input_channels,
+        "future_cov_dim": model.future_cov_dim,
+        "horizon": model.horizon
+    }
+    torch.save(checkpoint, filepath)
+    print(f"Модель и скейлеры сохранены в: {filepath}")
+
+def load_tcn_checkpoint(filepath, device="auto"):
+    """Загружает готовую модель и скейлеры из файла."""
+    device = resolve_device(device)
+    checkpoint = torch.load(filepath, map_location=device)
+    
+    cfg = TCNTrainConfig(**checkpoint["cfg"])
+    
+    model = TCNForecaster(
+        input_channels=checkpoint["input_channels"],
+        future_cov_dim=checkpoint["future_cov_dim"],
+        horizon=checkpoint["horizon"],
+        hidden_channels=cfg.hidden_channels,
+        levels=cfg.levels,
+        kernel_size=cfg.kernel_size,
+        dropout=cfg.dropout,
+    ).to(device)
+    
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    
+    return model, checkpoint["scales"], cfg
 
 class TCNWindowDataset(Dataset):
     """Оптимизированный Dataset: NumPy для скорости + сохранение временных индексов."""
@@ -198,6 +240,10 @@ class TCNForecaster(nn.Module):
         dropout=0.10,
     ):
         super().__init__()
+        self.input_channels = input_channels
+        self.future_cov_dim = future_cov_dim
+        self.horizon = horizon
+        
         layers = []
         for level in range(levels):
             dilation = 2**level
@@ -206,7 +252,6 @@ class TCNForecaster(nn.Module):
                 TemporalBlock(in_ch, hidden_channels, kernel_size, dilation, dropout)
             )
         self.tcn = nn.Sequential(*layers)
-        self.horizon = horizon
         self.head = nn.Sequential(
             nn.Linear(hidden_channels + future_cov_dim, hidden_channels),
             nn.ReLU(),
@@ -573,6 +618,9 @@ def run_tcn_fast_experiment(
         else:
             model, scales, history = train_tcn(train_real, None, max_horizon, cfg)
 
+        model_path = config.OUTPUT_DIR / f"tcn_model_fast_{train_mode}_h{max_horizon}.pt"
+        save_tcn_checkpoint(model, scales, cfg, model_path)    
+
         for item in history:
             histories.append(
                 {
@@ -728,6 +776,12 @@ def run_tcn_backtest(
                 model, scales, history = train_tcn(
                     real_train_slice, None, horizon, cfg
                 )
+
+            is_last_fold = (fold["fold"] == folds[-1]["fold"])
+            if is_last_fold:
+                from ... import config
+                model_path = config.OUTPUT_DIR / f"tcn_model_rolling_{train_mode}_h{horizon}.pt"
+                save_tcn_checkpoint(model, scales, cfg, model_path)    
 
             for item in history:
                 histories.append(
