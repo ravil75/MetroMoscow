@@ -7,6 +7,9 @@ from statsmodels.tsa.stattools import acf
 
 from . import config
 
+def get_synth_days(train_hours, base_synth_days=30, max_ratio=3.0):
+    ratio_days = int(train_hours / 24 * max_ratio)
+    return max(base_synth_days, min(ratio_days, 90))
 
 def generate_global_warp(n_hours=24, n_knots=4, sigma=0.06, low=0.75, high=1.25):
     x = np.linspace(0, n_hours - 1, n_knots)
