@@ -240,11 +240,12 @@ class TCNTrainConfig:
     amp: bool = True
 
 
-def train_tcn(train_real, synthetic_train, horizon, cfg, pretrained_model=None):
+def train_tcn(train_real, synthetic_train, horizon, cfg, pretrained_model=None, scale_source=None):
     """Обучает TCN. Если передан pretrained_model — дообучается поверх него."""
     set_seed(cfg.seed)
     object_ids = list(train_real.columns)
-    scales = compute_object_scales(train_real)
+    scales = compute_object_scales(scale_source if scale_source is not None else train_real)
+
     frames = [train_real]
     strides = [cfg.window_stride]
     if synthetic_train is not None:
@@ -331,31 +332,25 @@ def train_tcn(train_real, synthetic_train, horizon, cfg, pretrained_model=None):
     return model, scales, history
 
 
-def train_tcn_two_phase(train_real, synthetic_train, horizon, cfg):
-    """Двухфазное обучение: сначала синтетика, потом fine-tune на реале.
-
-    Фаза 1 (синтетика, большой stride): быстро обучаем общие паттерны.
-    Фаза 2 (только реал, малый stride): подгоняем под реальное распределение.
-    Если synthetic_train is None — обычное однофазное обучение на реале.
-    """
+def train_tcn_two_phase(train_real, synthetic_train, horizon, cfg, scale_source=None):
     if synthetic_train is None:
-        return train_tcn(train_real, None, horizon, cfg)
+        return train_tcn(train_real, None, horizon, cfg, scale_source=scale_source)
 
-    # Фаза 1: обучение на синтетике с большим stride (быстро, охват паттернов)
     synth_cfg = replace(cfg, window_stride=24)
     synth_cols = train_real.columns
     model, scales, history_phase1 = train_tcn(
-        synthetic_train[synth_cols], None, horizon, synth_cfg
+        synthetic_train[synth_cols], None, horizon, synth_cfg,
+        scale_source=scale_source  # передаём реальные данные для scales
     )
 
-    # Фаза 2: fine-tune на реале — меньше эпох, малый stride
     finetune_epochs = max(3, cfg.epochs // 3)
     real_cfg = replace(cfg, epochs=finetune_epochs, window_stride=1)
     model, scales, history_phase2 = train_tcn(
-        train_real, None, horizon, real_cfg, pretrained_model=model
+        train_real, None, horizon, real_cfg,
+        pretrained_model=model,
+        scale_source=scale_source
     )
 
-    # Помечаем историю для логов
     for item in history_phase1:
         item["phase"] = "synth_pretrain"
     for item in history_phase2:
@@ -662,6 +657,16 @@ def run_tcn_backtest(
         list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     )
     pivot_df = pivot_df[object_ids]
+
+    # Генерируем синтетическую неделю один раз до всех фолдов
+    prepended_synth = None
+    if "real_plus_synth" in train_modes:
+        from ...synthesis import prepend_synthetic_week
+        prepended_synth = prepend_synthetic_week(pivot_df, seed=cfg.seed)
+        print(
+            f"Synthetic week: {prepended_synth.index[0]} → {prepended_synth.index[-1]}"
+        )
+
     folds = make_rolling_folds(len(pivot_df), horizon, min_train_hours, step_hours)
     if max_folds is not None:
         folds = folds[-max_folds:]
@@ -673,41 +678,53 @@ def run_tcn_backtest(
     synth_validation_rows = []
 
     for fold in folds:
-        train_real = pivot_df.iloc[fold["train_start"] : fold["train_end"]]
-        test_real = pivot_df.iloc[fold["test_start"] : fold["test_end"]]
+        real_train_slice = pivot_df.iloc[fold["train_start"]:fold["train_end"]]
+        test_real = pivot_df.iloc[fold["test_start"]:fold["test_end"]]
         target_index = test_real.index
 
-        synthetic_train = None
-        if "real_plus_synth" in train_modes:
-            # Динамически подбираем количество синтетических дней под размер фолда
-            dynamic_days = get_synth_days(len(train_real), base_synth_days=synth_days)
-            print(
-                f"TCN h={horizon} fold={fold['fold']}: "
-                f"dynamic synth_days={dynamic_days} (train={len(train_real)}h)"
-            )
-            synthetic_train = synthesize_from_train(
-                train_real,
-                gen_days=dynamic_days,
-                seed=cfg.seed + fold["fold"] + horizon * 1000,
-            )
-            validation = validate_synthetic(train_real, synthetic_train)
+        # Валидируем синтетику один раз (только на первом фолде)
+        if fold["fold"] == 0 and prepended_synth is not None:
+            validation = validate_synthetic(real_train_slice, prepended_synth)
             validation.update({"fold": fold["fold"], "horizon": horizon})
             synth_validation_rows.append(validation)
 
         for train_mode in train_modes:
-            active_synth = synthetic_train if train_mode == "real_plus_synth" else None
+            if train_mode == "real_plus_synth" and prepended_synth is not None:
+                # Синтетическая неделя + реальные данные этого фолда
+                train_real = pd.concat(
+                    [prepended_synth, real_train_slice]
+                ).sort_index()
+
+                # Если реала совсем мало — добавляем ещё внутрифолдовой синтетики
+                fold_synth = None
+                if len(real_train_slice) < 72:
+                    dynamic_days = get_synth_days(
+                        len(real_train_slice), base_synth_days=synth_days
+                    )
+                    fold_synth = synthesize_from_train(
+                        real_train_slice,
+                        gen_days=dynamic_days,
+                        seed=cfg.seed + fold["fold"] + horizon * 1000,
+                    )
+            else:
+                train_real = real_train_slice
+                fold_synth = None
+
             print(
                 f"TCN h={horizon} fold={fold['fold']} mode={train_mode} "
-                f"train={len(train_real)}h test={len(test_real)}h objects={len(object_ids)}"
+                f"train={len(train_real)}h (real={len(real_train_slice)}h) "
+                f"test={len(test_real)}h objects={len(object_ids)}"
             )
 
-            # Двухфазное обучение для real_plus_synth, обычное для real_only
             if train_mode == "real_plus_synth":
                 model, scales, history = train_tcn_two_phase(
-                    train_real, active_synth, horizon, cfg
+                    train_real, fold_synth, horizon, cfg,
+                    scale_source=real_train_slice  # scales только по реалу
                 )
             else:
-                model, scales, history = train_tcn(train_real, None, horizon, cfg)
+                model, scales, history = train_tcn(
+                    real_train_slice, None, horizon, cfg
+                )
 
             for item in history:
                 histories.append(
@@ -720,7 +737,7 @@ def run_tcn_backtest(
                     }
                 )
 
-            pred_df = predict_tcn_batch(model, train_real, target_index, scales, cfg)
+            pred_df = predict_tcn_batch(model, real_train_slice, target_index, scales, cfg)
 
             for object_id in object_ids:
                 metric_row = forecast_metrics(
@@ -736,7 +753,7 @@ def run_tcn_backtest(
                     {
                         "test_start": target_index[0],
                         "test_end": target_index[-1],
-                        "train_hours": len(train_real),
+                        "train_hours": len(real_train_slice),
                         "test_data": "real",
                     }
                 )
