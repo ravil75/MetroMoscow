@@ -53,7 +53,6 @@ def get_active_objects(train_slice, object_ids, min_daily_pax=MIN_DAILY_PAX):
         oid for oid in object_ids
         if train_slice[oid].sum() / n_days >= min_daily_pax
     ]
-    # Если фильтр слишком жёсткий — возвращаем всех
     return active if len(active) >= 10 else list(object_ids)
 
 
@@ -324,7 +323,6 @@ def train_tcn(train_real, synthetic_train, horizon, cfg, pretrained_model=None, 
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     loss_fn = nn.SmoothL1Loss()
-    # Исправлен FutureWarning: используем новый API
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     model.train()
@@ -493,9 +491,8 @@ def predict_tcn_batch(model, history_frame, target_index, scales, cfg, batch_siz
             cov_batch = torch.from_numpy(future_cov_with_hint[start:stop]).to(device=device, dtype=torch.float32)
             pred_scaled = model(x_batch, cov_batch).cpu().numpy()
 
-            # Клиппинг в нормализованном пространстве + абсолютный потолок 10× среднего
             pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_logs[start:stop])
-            max_pred = np.expm1(scale_logs[start:stop]) * 10  # = scales * 10
+            max_pred = np.expm1(scale_logs[start:stop]) * 10
             pred = np.minimum(pred, max_pred)
             preds.append(np.maximum(pred, 0.0))
 
@@ -575,7 +572,6 @@ def run_tcn_fast_experiment(
                 "train_hours": train_hours,
             })
 
-        # Фильтр малых объектов
         active_objects = get_active_objects(train_real, object_ids)
         print(f"  Активных объектов для метрик: {len(active_objects)} / {len(object_ids)}")
 
@@ -666,7 +662,6 @@ def run_tcn_backtest(
             validation.update({"fold": fold["fold"], "horizon": horizon})
             synth_validation_rows.append(validation)
 
-        # Фильтр малых объектов для этого фолда
         active_objects = get_active_objects(real_train_slice, object_ids)
 
         for train_mode in train_modes:
@@ -697,7 +692,6 @@ def run_tcn_backtest(
             else:
                 model, scales, history = train_tcn(real_train_slice, None, horizon, cfg)
 
-            # Сохраняем модель последнего фолда
             if fold["fold"] == folds[-1]["fold"]:
                 model_path = config.OUTPUT_DIR / f"tcn_model_rolling_{train_mode}_h{horizon}.pt"
                 save_tcn_checkpoint(model, scales, cfg, model_path)
