@@ -16,6 +16,13 @@ from ...windowing import make_time_covariates
 from ... import config
 
 
+# Ночные часы — исключаются из расчёта метрик
+NIGHT_HOURS = frozenset({0, 1, 2, 3, 4, 5})
+
+# Минимальный средний суточный поток объекта для включения в метрики
+MIN_DAILY_PAX = 50
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -39,30 +46,43 @@ def compute_object_scales(train_real):
     return scales
 
 
+def get_active_objects(train_slice, object_ids, min_daily_pax=MIN_DAILY_PAX):
+    """Возвращает объекты со средним суточным потоком >= min_daily_pax."""
+    n_days = max(len(train_slice) / 24, 1.0)
+    active = [
+        oid for oid in object_ids
+        if train_slice[oid].sum() / n_days >= min_daily_pax
+    ]
+    # Если фильтр слишком жёсткий — возвращаем всех
+    return active if len(active) >= 10 else list(object_ids)
+
+
+def get_day_mask(target_index):
+    """Маска дневных часов: True = не ночной час."""
+    return np.array([ts.hour not in NIGHT_HOURS for ts in target_index])
+
+
 def save_tcn_checkpoint(model, scales, cfg, filepath):
     """Сохраняет веса модели, скейлеры и конфигурацию для будущего инференса."""
     filepath = Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
-    
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "scales": scales,
         "cfg": cfg.__dict__,
-        # Сохраняем архитектурные параметры, необходимые для инициализации
         "input_channels": model.input_channels,
         "future_cov_dim": model.future_cov_dim,
-        "horizon": model.horizon
+        "horizon": model.horizon,
     }
     torch.save(checkpoint, filepath)
     print(f"Модель и скейлеры сохранены в: {filepath}")
+
 
 def load_tcn_checkpoint(filepath, device="auto"):
     """Загружает готовую модель и скейлеры из файла."""
     device = resolve_device(device)
     checkpoint = torch.load(filepath, map_location=device)
-    
     cfg = TCNTrainConfig(**checkpoint["cfg"])
-    
     model = TCNForecaster(
         input_channels=checkpoint["input_channels"],
         future_cov_dim=checkpoint["future_cov_dim"],
@@ -72,11 +92,10 @@ def load_tcn_checkpoint(filepath, device="auto"):
         kernel_size=cfg.kernel_size,
         dropout=cfg.dropout,
     ).to(device)
-    
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    
     return model, checkpoint["scales"], cfg
+
 
 class TCNWindowDataset(Dataset):
     """Оптимизированный Dataset: NumPy для скорости + сохранение временных индексов."""
@@ -96,31 +115,21 @@ class TCNWindowDataset(Dataset):
         self.horizon = horizon
         self.stride = max(int(stride), 1)
         self.samples = []
-
         self.frames_np = []
         self.covariates_np = []
 
-        # 1. Предвычисления: готовим данные в NumPy, пока есть доступ к индексам Pandas
         for frame in frames:
             if len(frame) == 0:
                 continue
-
-            # Сортируем один раз
             frame = frame.sort_index()
-
-            # Сохраняем значения как массив [Time x Stations]
             self.frames_np.append(frame[self.object_ids].values.astype(np.float32))
-
-            # Генерируем ковариаты, используя ИНДЕКС датафрейма, и сразу в NumPy
             cov = make_time_covariates(frame.index, is_synthetic=is_synthetic)
             self.covariates_np.append(cov.values.astype(np.float32))
 
-        # Предвычисляем логарифмы скейлеров
         self.scales_log_np = np.log1p(
             np.array([scales[oid] for oid in self.object_ids], dtype=np.float32)
         )
 
-        # Собираем индексы сэмплов (теперь работаем только с длинами массивов)
         for frame_idx, frame_np in enumerate(self.frames_np):
             max_start = len(frame_np) - past_window - horizon
             if max_start < 0:
@@ -144,7 +153,6 @@ class TCNWindowDataset(Dataset):
         history = data_np[h_start:h_end, col_idx]
         target = data_np[t_start:t_end, col_idx]
 
-        # --- УМНЫЙ SEASONAL HINT С ЗАПОЛНЕНИЕМ СРЕДНИМ ---
         s_start = t_start - 24
         s_end = t_end - 24
 
@@ -155,16 +163,14 @@ class TCNWindowDataset(Dataset):
             available_len = s_end
             if available_len > 0:
                 missing_len = self.horizon - available_len
-                parts = [
+                seasonal_values = np.concatenate([
                     np.full(missing_len, fallback_mean),
                     data_np[0:available_len, col_idx],
-                ]
-                seasonal_values = np.concatenate(parts)
+                ])
             else:
                 seasonal_values = np.full(self.horizon, fallback_mean)
 
         seasonal_hint = (np.log1p(seasonal_values) / scale_log).reshape(-1, 1)
-
         x_value = (np.log1p(history) / scale_log).reshape(-1, 1)
         x_cov = cov_np[h_start:h_end]
         future_cov = cov_np[t_start:t_end]
@@ -194,31 +200,17 @@ class TemporalBlock(nn.Module):
         super().__init__()
         padding = (kernel_size - 1) * dilation
         self.net = nn.Sequential(
-            nn.Conv1d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                padding=padding,
-                dilation=dilation,
-            ),
+            nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation),
             Chomp1d(padding),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Conv1d(
-                out_channels,
-                out_channels,
-                kernel_size,
-                padding=padding,
-                dilation=dilation,
-            ),
+            nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding, dilation=dilation),
             Chomp1d(padding),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
         self.downsample = (
-            nn.Conv1d(in_channels, out_channels, 1)
-            if in_channels != out_channels
-            else None
+            nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
         )
         self.activation = nn.ReLU()
 
@@ -243,14 +235,12 @@ class TCNForecaster(nn.Module):
         self.input_channels = input_channels
         self.future_cov_dim = future_cov_dim
         self.horizon = horizon
-        
+
         layers = []
         for level in range(levels):
-            dilation = 2**level
+            dilation = 2 ** level
             in_ch = input_channels if level == 0 else hidden_channels
-            layers.append(
-                TemporalBlock(in_ch, hidden_channels, kernel_size, dilation, dropout)
-            )
+            layers.append(TemporalBlock(in_ch, hidden_channels, kernel_size, dilation, dropout))
         self.tcn = nn.Sequential(*layers)
         self.head = nn.Sequential(
             nn.Linear(hidden_channels + future_cov_dim, hidden_channels),
@@ -268,7 +258,7 @@ class TCNForecaster(nn.Module):
 
 @dataclass
 class TCNTrainConfig:
-    past_window: int = 72          # было 48 — теперь захватываем 3 дня
+    past_window: int = 48
     epochs: int = 15
     batch_size: int = 512
     learning_rate: float = 1e-3
@@ -299,21 +289,14 @@ def train_tcn(train_real, synthetic_train, horizon, cfg, pretrained_model=None, 
 
     datasets = [
         TCNWindowDataset(
-            [frame],
-            object_ids,
-            scales,
-            cfg.past_window,
-            horizon,
-            stride=stride,
-            is_synthetic=int(i > 0),
+            [frame], object_ids, scales, cfg.past_window, horizon,
+            stride=stride, is_synthetic=int(i > 0),
         )
         for i, (frame, stride) in enumerate(zip(frames, strides))
     ]
-    usable = [dataset for dataset in datasets if len(dataset)]
+    usable = [d for d in datasets if len(d)]
     if not usable:
-        raise ValueError(
-            "No TCN training windows were created. Increase train size or reduce past_window."
-        )
+        raise ValueError("No TCN training windows were created. Increase train size or reduce past_window.")
     train_dataset = usable[0] if len(usable) == 1 else torch.utils.data.ConcatDataset(usable)
 
     loader = DataLoader(
@@ -336,15 +319,13 @@ def train_tcn(train_real, synthetic_train, horizon, cfg, pretrained_model=None, 
         dropout=cfg.dropout,
     ).to(device)
 
-    # Загружаем веса из pretrained_model если передан (fine-tune фаза)
     if pretrained_model is not None:
         model.load_state_dict(pretrained_model.state_dict())
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     loss_fn = nn.SmoothL1Loss()
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == "cuda")
+    # Исправлен FutureWarning: используем новый API
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     model.train()
     history = []
@@ -357,7 +338,7 @@ def train_tcn(train_real, synthetic_train, horizon, cfg, pretrained_model=None, 
             y = y.to(device=device, dtype=torch.float32)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=cfg.amp and device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=cfg.amp and device.type == "cuda"):
                 pred = model(x_seq, future_cov)
                 loss = loss_fn(pred, y)
             scaler.scale(loss).backward()
@@ -382,18 +363,14 @@ def train_tcn_two_phase(train_real, synthetic_train, horizon, cfg, scale_source=
         return train_tcn(train_real, None, horizon, cfg, scale_source=scale_source)
 
     synth_cfg = replace(cfg, window_stride=24)
-    synth_cols = train_real.columns
     model, scales, history_phase1 = train_tcn(
-        synthetic_train[synth_cols], None, horizon, synth_cfg,
-        scale_source=scale_source  # передаём реальные данные для scales
+        synthetic_train[train_real.columns], None, horizon, synth_cfg, scale_source=scale_source
     )
 
     finetune_epochs = max(3, cfg.epochs // 3)
     real_cfg = replace(cfg, epochs=finetune_epochs, window_stride=1)
     model, scales, history_phase2 = train_tcn(
-        train_real, None, horizon, real_cfg,
-        pretrained_model=model,
-        scale_source=scale_source
+        train_real, None, horizon, real_cfg, pretrained_model=model, scale_source=scale_source
     )
 
     for item in history_phase1:
@@ -412,9 +389,7 @@ def _make_inference_tensors(series, target_index, scale, past_window):
             (past_window - len(series), 0),
             constant_values=pad_value,
         )
-        hist_index = pd.date_range(
-            end=series.index[-1], periods=past_window, freq="h"
-        )
+        hist_index = pd.date_range(end=series.index[-1], periods=past_window, freq="h")
         history = pd.Series(padded_values[-past_window:], index=hist_index)
     else:
         history = series.iloc[-past_window:]
@@ -424,18 +399,17 @@ def _make_inference_tensors(series, target_index, scale, past_window):
 
     if len(series) >= 24:
         s_end_idx = -24 + horizon
-        if s_end_idx < 0:
-            seasonal_values = series.iloc[-24:s_end_idx].values.astype(np.float32)
-        else:
-            seasonal_values = series.iloc[-24:].values.astype(np.float32)
+        seasonal_values = (
+            series.iloc[-24:s_end_idx].values.astype(np.float32)
+            if s_end_idx < 0
+            else series.iloc[-24:].values.astype(np.float32)
+        )
     else:
         seasonal_values = np.full(horizon, float(series.mean()), dtype=np.float32)
 
     x_value = (np.log1p(history.values.astype(np.float32)) / scale_log).reshape(-1, 1)
     x_cov = make_time_covariates(history.index, is_synthetic=0).values.astype(np.float32)
-    future_cov = make_time_covariates(target_index, is_synthetic=0).values.astype(
-        np.float32
-    )
+    future_cov = make_time_covariates(target_index, is_synthetic=0).values.astype(np.float32)
     seasonal_hint = (np.log1p(seasonal_values) / scale_log).reshape(-1, 1)
     future_cov_with_hint = np.concatenate([future_cov, seasonal_hint], axis=1)
     x_seq = np.concatenate([x_value, x_cov], axis=1).T
@@ -453,20 +427,15 @@ def predict_tcn(model, train_real, target_index, scales, cfg):
     with torch.no_grad():
         for object_id in train_real.columns:
             x_seq, future_cov = _make_inference_tensors(
-                train_real[object_id],
-                target_index,
-                scales[object_id],
-                cfg.past_window,
+                train_real[object_id], target_index, scales[object_id], cfg.past_window
             )
             x_seq = x_seq.to(device=device, dtype=torch.float32)
             future_cov = future_cov.to(device=device, dtype=torch.float32)
             pred_scaled = model(x_seq, future_cov).cpu().numpy().reshape(-1)
-            # Клиппинг в лог-пространстве чтобы избежать взрывных предсказаний
             scale_log = np.log1p(scales[object_id])
             pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_log)
-            pred = np.minimum(pred, scales[object_id] * 10)  # не более 10× среднего
+            pred = np.minimum(pred, scales[object_id] * 10)
             predictions[object_id] = np.maximum(pred, 0.0)
-
     return predictions
 
 
@@ -479,7 +448,7 @@ def predict_tcn_batch(model, history_frame, target_index, scales, cfg, batch_siz
     model.eval()
 
     if len(history_frame) >= cfg.past_window:
-        history = history_frame.iloc[-cfg.past_window :]
+        history = history_frame.iloc[-cfg.past_window:]
         history_index = history.index
         values = history.values.astype(np.float32).T  # [Stations x PastWindow]
     else:
@@ -493,54 +462,40 @@ def predict_tcn_batch(model, history_frame, target_index, scales, cfg, batch_siz
         for object_id in object_ids:
             series_values = history_frame[object_id].values.astype(np.float32)
             pad_value = float(series_values.mean()) if len(series_values) else 0.0
-            padded = np.pad(
-                series_values, (missing, 0), constant_values=pad_value
-            )[-cfg.past_window :]
+            padded = np.pad(series_values, (missing, 0), constant_values=pad_value)[-cfg.past_window:]
             values.append(padded)
         values = np.asarray(values, dtype=np.float32)
 
     scale_logs = np.log1p(
-        np.asarray([scales[object_id] for object_id in object_ids], dtype=np.float32)
+        np.asarray([scales[oid] for oid in object_ids], dtype=np.float32)
     ).reshape(-1, 1)
+
     x_value = np.log1p(values) / scale_logs
-    x_cov = make_time_covariates(history_index, is_synthetic=0).values.astype(
-        np.float32
-    )
-    x_cov = np.broadcast_to(
-        x_cov[None, :, :], (len(object_ids), cfg.past_window, x_cov.shape[1])
-    )
+    x_cov = make_time_covariates(history_index, is_synthetic=0).values.astype(np.float32)
+    x_cov = np.broadcast_to(x_cov[None, :, :], (len(object_ids), cfg.past_window, x_cov.shape[1]))
     x_seq = np.concatenate([x_value[:, :, None], x_cov], axis=2).transpose(0, 2, 1)
 
     horizon = len(target_index)
     s_start = cfg.past_window - 24
     s_end = s_start + horizon
     seasonal_pax = values[:, s_start:s_end]
-    seasonal_hint = np.log1p(seasonal_pax) / scale_logs  # [Stations x Horizon]
+    seasonal_hint = np.log1p(seasonal_pax) / scale_logs
 
-    future_cov = make_time_covariates(target_index, is_synthetic=0).values.astype(
-        np.float32
-    )
-    future_cov = np.broadcast_to(
-        future_cov[None, :, :], (len(object_ids), horizon, future_cov.shape[1])
-    )
-    future_cov_with_hint = np.concatenate(
-        [future_cov, seasonal_hint[:, :, None]], axis=2
-    )
+    future_cov = make_time_covariates(target_index, is_synthetic=0).values.astype(np.float32)
+    future_cov = np.broadcast_to(future_cov[None, :, :], (len(object_ids), horizon, future_cov.shape[1]))
+    future_cov_with_hint = np.concatenate([future_cov, seasonal_hint[:, :, None]], axis=2)
 
     preds = []
     with torch.no_grad():
         for start in range(0, len(object_ids), batch_size):
             stop = start + batch_size
-            x_batch = torch.from_numpy(x_seq[start:stop]).to(
-                device=device, dtype=torch.float32
-            )
-            cov_batch = torch.from_numpy(future_cov_with_hint[start:stop]).to(
-                device=device, dtype=torch.float32
-            )
+            x_batch = torch.from_numpy(x_seq[start:stop]).to(device=device, dtype=torch.float32)
+            cov_batch = torch.from_numpy(future_cov_with_hint[start:stop]).to(device=device, dtype=torch.float32)
             pred_scaled = model(x_batch, cov_batch).cpu().numpy()
-            # Клиппинг в лог-пространстве — убирает взрывной WAPE
+
+            # Клиппинг в нормализованном пространстве + абсолютный потолок 10× среднего
             pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_logs[start:stop])
-            max_pred = np.expm1(scale_logs[start:stop]) * 10  # expm1(log1p(scale)) = scale
+            max_pred = np.expm1(scale_logs[start:stop]) * 10  # = scales * 10
             pred = np.minimum(pred, max_pred)
             preds.append(np.maximum(pred, 0.0))
 
@@ -570,7 +525,7 @@ def run_tcn_fast_experiment(
 ):
     """Train once per mode, then evaluate many real forecast origins."""
     cfg = cfg or TCNTrainConfig()
-    horizons = sorted(set(int(horizon) for horizon in horizons))
+    horizons = sorted(set(int(h) for h in horizons))
     max_horizon = max(horizons)
     if train_hours < cfg.past_window + max_horizon:
         raise ValueError(
@@ -579,9 +534,7 @@ def run_tcn_fast_experiment(
         )
 
     pivot_df = pivot_df.sort_index()
-    object_ids = (
-        list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
-    )
+    object_ids = list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     pivot_df = pivot_df[object_ids]
     train_real = pivot_df.iloc[:train_hours]
 
@@ -591,13 +544,10 @@ def run_tcn_fast_experiment(
 
     synthetic_train = None
     if "real_plus_synth" in train_modes:
-        # Динамически подбираем количество синтетических дней
         dynamic_days = get_synth_days(len(train_real), base_synth_days=synth_days)
         print(f"TCN fast: dynamic synth_days={dynamic_days} (train={len(train_real)}h)")
         synthetic_train = synthesize_from_train(
-            train_real,
-            gen_days=dynamic_days,
-            seed=cfg.seed + max_horizon * 1000,
+            train_real, gen_days=dynamic_days, seed=cfg.seed + max_horizon * 1000
         )
         validation = validate_synthetic(train_real, synthetic_train)
         validation.update({"horizon": max_horizon, "protocol": "fast_single_train"})
@@ -605,84 +555,65 @@ def run_tcn_fast_experiment(
 
     for train_mode in train_modes:
         active_synth = synthetic_train if train_mode == "real_plus_synth" else None
-        print(
-            f"TCN fast mode={train_mode} train={len(train_real)}h "
-            f"max_horizon={max_horizon} objects={len(object_ids)}"
-        )
+        print(f"TCN fast mode={train_mode} train={len(train_real)}h max_horizon={max_horizon} objects={len(object_ids)}")
 
-        # Двухфазное обучение для real_plus_synth
         if train_mode == "real_plus_synth":
-            model, scales, history = train_tcn_two_phase(
-                train_real, active_synth, max_horizon, cfg
-            )
+            model, scales, history = train_tcn_two_phase(train_real, active_synth, max_horizon, cfg)
         else:
             model, scales, history = train_tcn(train_real, None, max_horizon, cfg)
 
         model_path = config.OUTPUT_DIR / f"tcn_model_fast_{train_mode}_h{max_horizon}.pt"
-        save_tcn_checkpoint(model, scales, cfg, model_path)    
+        save_tcn_checkpoint(model, scales, cfg, model_path)
 
         for item in history:
-            histories.append(
-                {
-                    **item,
-                    "horizon": max_horizon,
-                    "train_mode": train_mode,
-                    "model": "TCN",
-                    "protocol": "fast_single_train",
-                    "train_hours": train_hours,
-                }
-            )
+            histories.append({
+                **item,
+                "horizon": max_horizon,
+                "train_mode": train_mode,
+                "model": "TCN",
+                "protocol": "fast_single_train",
+                "train_hours": train_hours,
+            })
+
+        # Фильтр малых объектов
+        active_objects = get_active_objects(train_real, object_ids)
+        print(f"  Активных объектов для метрик: {len(active_objects)} / {len(object_ids)}")
 
         for horizon in horizons:
-            if horizon == 1:
-                step_hours = eval_step_1h
-                max_eval_windows = max_eval_windows_1h
-            elif horizon == 24:
-                step_hours = eval_step_24h
-                max_eval_windows = max_eval_windows_24h
-            else:
-                step_hours = horizon
-                max_eval_windows = None
+            step_hours = eval_step_1h if horizon == 1 else (eval_step_24h if horizon == 24 else horizon)
+            max_eval_windows = max_eval_windows_1h if horizon == 1 else (max_eval_windows_24h if horizon == 24 else None)
 
-            starts = _eval_starts(
-                len(pivot_df), train_hours, horizon, step_hours, max_eval_windows
-            )
+            starts = _eval_starts(len(pivot_df), train_hours, horizon, step_hours, max_eval_windows)
             for eval_idx, start in enumerate(starts):
-                forecast_index = pd.date_range(
-                    start=pivot_df.index[start],
-                    periods=max_horizon,
-                    freq="h",
-                )
-                y_true = pivot_df.iloc[start : start + horizon]
+                forecast_index = pd.date_range(start=pivot_df.index[start], periods=max_horizon, freq="h")
+                y_true = pivot_df.iloc[start: start + horizon]
                 history_frame = pivot_df.iloc[:start]
-                pred = predict_tcn_batch(
-                    model, history_frame, forecast_index, scales, cfg
-                ).iloc[:horizon]
+                pred = predict_tcn_batch(model, history_frame, forecast_index, scales, cfg).iloc[:horizon]
 
-                for object_id in object_ids:
+                # Маска дневных часов
+                day_mask = get_day_mask(y_true.index)
+
+                for object_id in active_objects:
+                    y_true_day = y_true[object_id].values[day_mask]
+                    y_pred_day = pred[object_id].values[day_mask]
+                    if len(y_true_day) == 0:
+                        continue
+
                     metric_row = forecast_metrics(
-                        y_true[object_id].values,
-                        pred[object_id].values,
-                        model_name="TCN",
-                        horizon=horizon,
-                        train_mode=train_mode,
-                        object_id=object_id,
-                        fold=eval_idx,
+                        y_true_day, y_pred_day,
+                        model_name="TCN", horizon=horizon, train_mode=train_mode,
+                        object_id=object_id, fold=eval_idx,
                     )
-                    metric_row.update(
-                        {
-                            "test_start": y_true.index[0],
-                            "test_end": y_true.index[-1],
-                            "train_hours": train_hours,
-                            "test_data": "real",
-                            "protocol": "fast_single_train",
-                        }
-                    )
+                    metric_row.update({
+                        "test_start": y_true.index[0],
+                        "test_end": y_true.index[-1],
+                        "train_hours": train_hours,
+                        "test_data": "real",
+                        "protocol": "fast_single_train",
+                    })
                     rows.append(metric_row)
 
-            print(
-                f"TCN fast mode={train_mode} h={horizon}: evaluated {len(starts)} real windows"
-            )
+            print(f"TCN fast mode={train_mode} h={horizon}: evaluated {len(starts)} real windows")
 
     results = pd.DataFrame(rows)
     summary = summarize_results(results)
@@ -704,9 +635,7 @@ def run_tcn_backtest(
 ):
     cfg = cfg or TCNTrainConfig()
     pivot_df = pivot_df.sort_index()
-    object_ids = (
-        list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
-    )
+    object_ids = list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     pivot_df = pivot_df[object_ids]
 
     # Генерируем синтетическую неделю один раз до всех фолдов
@@ -714,9 +643,7 @@ def run_tcn_backtest(
     if "real_plus_synth" in train_modes:
         from ...synthesis import prepend_synthetic_week
         prepended_synth = prepend_synthetic_week(pivot_df, seed=cfg.seed)
-        print(
-            f"Synthetic week: {prepended_synth.index[0]} → {prepended_synth.index[-1]}"
-        )
+        print(f"Synthetic week: {prepended_synth.index[0]} → {prepended_synth.index[-1]}")
 
     folds = make_rolling_folds(len(pivot_df), horizon, min_train_hours, step_hours)
     if max_folds is not None:
@@ -733,25 +660,21 @@ def run_tcn_backtest(
         test_real = pivot_df.iloc[fold["test_start"]:fold["test_end"]]
         target_index = test_real.index
 
-        # Валидируем синтетику один раз (только на первом фолде)
+        # Валидируем синтетику один раз на первом фолде
         if fold["fold"] == 0 and prepended_synth is not None:
             validation = validate_synthetic(real_train_slice, prepended_synth)
             validation.update({"fold": fold["fold"], "horizon": horizon})
             synth_validation_rows.append(validation)
 
+        # Фильтр малых объектов для этого фолда
+        active_objects = get_active_objects(real_train_slice, object_ids)
+
         for train_mode in train_modes:
             if train_mode == "real_plus_synth" and prepended_synth is not None:
-                # Синтетическая неделя + реальные данные этого фолда
-                train_real = pd.concat(
-                    [prepended_synth, real_train_slice]
-                ).sort_index()
-
-                # Если реала совсем мало — добавляем ещё внутрифолдовой синтетики
+                train_real = pd.concat([prepended_synth, real_train_slice]).sort_index()
                 fold_synth = None
                 if len(real_train_slice) < 72:
-                    dynamic_days = get_synth_days(
-                        len(real_train_slice), base_synth_days=synth_days
-                    )
+                    dynamic_days = get_synth_days(len(real_train_slice), base_synth_days=synth_days)
                     fold_synth = synthesize_from_train(
                         real_train_slice,
                         gen_days=dynamic_days,
@@ -764,56 +687,57 @@ def run_tcn_backtest(
             print(
                 f"TCN h={horizon} fold={fold['fold']} mode={train_mode} "
                 f"train={len(train_real)}h (real={len(real_train_slice)}h) "
-                f"test={len(test_real)}h objects={len(object_ids)}"
+                f"test={len(test_real)}h active={len(active_objects)}/{len(object_ids)}"
             )
 
             if train_mode == "real_plus_synth":
                 model, scales, history = train_tcn_two_phase(
-                    train_real, fold_synth, horizon, cfg,
-                    scale_source=real_train_slice  # scales только по реалу
+                    train_real, fold_synth, horizon, cfg, scale_source=real_train_slice
                 )
             else:
-                model, scales, history = train_tcn(
-                    real_train_slice, None, horizon, cfg
-                )
+                model, scales, history = train_tcn(real_train_slice, None, horizon, cfg)
 
-            is_last_fold = (fold["fold"] == folds[-1]["fold"])
-            if is_last_fold:
-                from ... import config
+            # Сохраняем модель последнего фолда
+            if fold["fold"] == folds[-1]["fold"]:
                 model_path = config.OUTPUT_DIR / f"tcn_model_rolling_{train_mode}_h{horizon}.pt"
-                save_tcn_checkpoint(model, scales, cfg, model_path)    
+                save_tcn_checkpoint(model, scales, cfg, model_path)
 
             for item in history:
-                histories.append(
-                    {
-                        **item,
-                        "horizon": horizon,
-                        "fold": fold["fold"],
-                        "train_mode": train_mode,
-                        "model": "TCN",
-                    }
-                )
+                histories.append({
+                    **item,
+                    "horizon": horizon,
+                    "fold": fold["fold"],
+                    "train_mode": train_mode,
+                    "model": "TCN",
+                })
 
             pred_df = predict_tcn_batch(model, real_train_slice, target_index, scales, cfg)
 
-            for object_id in object_ids:
+            # Маска дневных часов для тестового окна
+            day_mask = get_day_mask(target_index)
+
+            for object_id in active_objects:
+                y_true_obj = test_real[object_id].values[day_mask]
+                y_pred_obj = pred_df[object_id].values[day_mask]
+
+                # Если фолд полностью ночной (h=1) — пропускаем
+                if len(y_true_obj) == 0:
+                    continue
+
                 metric_row = forecast_metrics(
-                    test_real[object_id].values,
-                    pred_df[object_id].values,
+                    y_true_obj, y_pred_obj,
                     model_name="TCN",
                     horizon=horizon,
                     train_mode=train_mode,
                     object_id=object_id,
                     fold=fold["fold"],
                 )
-                metric_row.update(
-                    {
-                        "test_start": target_index[0],
-                        "test_end": target_index[-1],
-                        "train_hours": len(real_train_slice),
-                        "test_data": "real",
-                    }
-                )
+                metric_row.update({
+                    "test_start": target_index[0],
+                    "test_end": target_index[-1],
+                    "train_hours": len(real_train_slice),
+                    "test_data": "real",
+                })
                 rows.append(metric_row)
 
     results = pd.DataFrame(rows)
