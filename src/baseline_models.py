@@ -17,7 +17,10 @@ def forecast_metrics(y_true, y_pred, model_name, horizon, train_mode, object_id=
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     mape = np.mean(np.abs(y_true - y_pred) / np.maximum(np.abs(y_true), 1.0)) * 100.0
     smape = np.mean(2.0 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100.0
-    wape = np.sum(np.abs(y_true - y_pred)) / max(np.sum(np.abs(y_true)), 1.0) * 100.0
+    if np.sum(np.abs(y_true)) < 100:
+        wape = np.nan
+    else:    
+        wape = np.sum(np.abs(y_true - y_pred)) / max(np.sum(np.abs(y_true)), 1.0) * 100.0
     return {
         "model": model_name,
         "train_mode": train_mode,

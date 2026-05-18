@@ -20,7 +20,7 @@ from ... import config
 NIGHT_HOURS = frozenset({0, 1, 2, 3, 4, 5})
 
 # Минимальный средний суточный поток объекта для включения в метрики
-MIN_DAILY_PAX = 50
+MIN_DAILY_PAX = 100
 
 
 def set_seed(seed):

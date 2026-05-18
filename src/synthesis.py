@@ -106,11 +106,16 @@ def synthesize_from_train(
         if is_holiday:
             chosen_day *= np.random.uniform(0.75, 0.90)
 
-        global_warp = generate_global_warp(sigma=0.06)
+        is_weekend_day = target_dow >= 5
+        warp_sigma = 0.12 if is_weekend_day else 0.06
+        global_warp = generate_global_warp(sigma=warp_sigma)
+
         warped_day = chosen_day * global_warp[:, None]
 
         if use_cluster_warp:
-            cluster_warps = {cluster: generate_cluster_warp(sigma=0.04) for cluster in clusters}
+            cluster_sigma = 0.08 if is_weekend_day else 0.04
+            cluster_warps = {cluster: generate_cluster_warp(sigma=cluster_sigma) for cluster in clusters}
+
             for col_idx, object_id in enumerate(object_ids):
                 cluster = obj_to_cluster.get(object_id, -1)
                 warped_day[:, col_idx] *= 1.0 + cluster_warps[cluster]
