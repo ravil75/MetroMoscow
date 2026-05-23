@@ -1,9 +1,11 @@
 import argparse
+import pandas as pd
 
 from ... import config
 from ...clustering import run_clustering
 from ...data_prep import create_hourly_parquet, create_object_hourly_parquet, load_hourly, make_pivot
 from ...synthesis import save_generation_config
+from ...static_features import build_static_covariates, encode_static_covariates
 from .pipeline import TFTTrainConfig, run_tft_backtest, run_tft_fast_experiment
 
 
@@ -65,6 +67,12 @@ def main():
     pivot = make_pivot(hourly, top_n=args.top_n)
     print(f"pivot: {pivot.shape[0]} hours x {pivot.shape[1]} objects")
 
+    # ИЗВЛЕКАЕМ СТАТИКУ НАПРЯМУЮ ИЗ HOURLY
+    object_ids = list(pivot.columns[:args.max_objects]) if args.max_objects else list(pivot.columns)
+    print("Генерация статических признаков...")
+    static_df = build_static_covariates(hourly, object_ids=object_ids)
+    static_enc = encode_static_covariates(static_df)
+
     train_cfg = TFTTrainConfig(
         past_window=args.past_window,
         epochs=args.epochs,
@@ -85,7 +93,7 @@ def main():
     all_validation = []
     if args.protocol == "fast":
         results, summary, history, synth_validation = run_tft_fast_experiment(
-            pivot, horizons=args.horizons, train_modes=args.train_modes,
+            pivot, static_enc, horizons=args.horizons, train_modes=args.train_modes,
             synth_days=args.synth_days, train_hours=args.train_hours,
             eval_step_1h=args.eval_step_1h, eval_step_24h=args.eval_step_24h,
             max_eval_windows_1h=args.max_eval_windows_1h, max_eval_windows_24h=args.max_eval_windows_24h,
@@ -111,7 +119,7 @@ def main():
                 min_train_hours, step_hours = max(args.past_window + horizon + 24, 96), horizon
 
             results, summary, history, synth_validation = run_tft_backtest(
-                pivot, horizon=horizon, train_modes=args.train_modes,
+                pivot, static_enc, horizon=horizon, train_modes=args.train_modes,
                 synth_days=args.synth_days, min_train_hours=min_train_hours,
                 step_hours=step_hours, max_folds=args.max_folds,
                 max_objects=args.max_objects, cfg=train_cfg,

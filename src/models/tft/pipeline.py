@@ -13,7 +13,6 @@ from ...backtest import make_rolling_folds, summarize_results
 from ...baseline_models import forecast_metrics
 from ...synthesis import get_synth_days, synthesize_from_train, validate_synthetic
 from ...windowing import make_time_covariates
-from ...static_features import build_static_covariates, encode_static_covariates
 
 NIGHT_HOURS = frozenset({0, 1, 2, 3, 4, 5})
 MIN_DAILY_PAX = 100
@@ -63,7 +62,7 @@ def save_tft_checkpoint(model, scales, static_enc, cfg, filepath):
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "scales": scales,
-        "static_enc": static_enc,  # сохраняем словари кодирования
+        "static_enc": static_enc,
         "cfg": cfg.__dict__,
         "model_params": {
             "cat_cardinalities": model.cat_cardinalities,
@@ -100,7 +99,6 @@ def load_tft_checkpoint(filepath, device="auto"):
 # ──────────────────────── Архитектура TFT ────────────────────────
 
 class GLU(nn.Module):
-    """Gated Linear Unit"""
     def __init__(self, d_model):
         super().__init__()
         self.fc = nn.Linear(d_model, d_model * 2)
@@ -111,7 +109,6 @@ class GLU(nn.Module):
 
 
 class GRN(nn.Module):
-    """Gated Residual Network"""
     def __init__(self, d_model, hidden_size, dropout=0.1):
         super().__init__()
         self.fc1 = nn.Linear(d_model, hidden_size)
@@ -120,8 +117,6 @@ class GRN(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.gate = GLU(d_model)
         self.ln = nn.LayerNorm(d_model)
-        
-        # Проекция контекста (опционально)
         self.context_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, x, context=None):
@@ -135,16 +130,9 @@ class GRN(nn.Module):
 
 
 class TFTForecaster(nn.Module):
-    """Temporal Fusion Transformer (Оптимизированная версия)"""
     def __init__(
-        self, 
-        cat_cardinalities, 
-        num_cont_static, 
-        num_past_features, 
-        num_future_features, 
-        hidden_size=64, 
-        num_heads=4, 
-        dropout=0.1
+        self, cat_cardinalities, num_cont_static, num_past_features, 
+        num_future_features, hidden_size=64, num_heads=4, dropout=0.1
     ):
         super().__init__()
         self.cat_cardinalities = cat_cardinalities
@@ -153,72 +141,58 @@ class TFTForecaster(nn.Module):
         self.num_future_features = num_future_features
         self.hidden_size = hidden_size
 
-        # 1. Статические энкодеры
-        self.cat_embs = nn.ModuleList([
-            nn.Embedding(c, hidden_size) for c in cat_cardinalities
-        ])
+        self.cat_embs = nn.ModuleList([nn.Embedding(c, hidden_size) for c in cat_cardinalities])
         self.cont_proj = nn.Linear(num_cont_static, hidden_size) if num_cont_static > 0 else None
         self.static_grn = GRN(hidden_size, hidden_size, dropout)
         
-        # 2. Проекции временных рядов
         self.past_proj = nn.Linear(num_past_features, hidden_size)
         self.future_proj = nn.Linear(num_future_features, hidden_size)
         
         self.past_grn = GRN(hidden_size, hidden_size, dropout)
         self.future_grn = GRN(hidden_size, hidden_size, dropout)
 
-        # 3. Seq2Seq LSTM (с инициализацией из статического контекста)
         self.h0_proj = nn.Linear(hidden_size, hidden_size)
         self.c0_proj = nn.Linear(hidden_size, hidden_size)
         self.encoder_lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)
         self.decoder_lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)
 
-        # 4. Multi-Head Attention (Будущее -> Прошлое)
         self.attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
         self.attn_norm = nn.LayerNorm(hidden_size)
 
-        # 5. Выход
         self.post_attn_grn = GRN(hidden_size, hidden_size, dropout)
         self.output_layer = nn.Linear(hidden_size, 1)
 
     def forward(self, x_past, x_future, cat_static, cont_static):
-        # 1. Формирование статического контекста
         embs = [emb(cat_static[:, i]) for i, emb in enumerate(self.cat_embs)]
         if self.cont_proj is not None:
             embs.append(self.cont_proj(cont_static))
         
-        static_stacked = torch.stack(embs, dim=1) # [B, N_features, hidden_size]
-        static_context = self.static_grn(static_stacked.mean(dim=1)) # [B, hidden_size]
+        static_stacked = torch.stack(embs, dim=1) 
+        static_context = self.static_grn(static_stacked.mean(dim=1)) 
 
-        # 2. Временные признаки + статический контекст
         past_emb = self.past_proj(x_past)
         future_emb = self.future_proj(x_future)
         
         past_emb = self.past_grn(past_emb, context=static_context.unsqueeze(1))
         future_emb = self.future_grn(future_emb, context=static_context.unsqueeze(1))
 
-        # 3. Инициализация и проход LSTM
-        h0 = self.h0_proj(static_context).unsqueeze(0) # [1, B, H]
-        c0 = self.c0_proj(static_context).unsqueeze(0) # [1, B, H]
+        h0 = self.h0_proj(static_context).unsqueeze(0) 
+        c0 = self.c0_proj(static_context).unsqueeze(0) 
         
         past_out, (h_past, c_past) = self.encoder_lstm(past_emb, (h0, c0))
         future_out, _ = self.decoder_lstm(future_emb, (h_past, c_past))
 
-        # 4. Attention (Decoder обращается к памяти Encoder-а)
         attn_out, _ = self.attn(query=future_out, key=past_out, value=past_out)
         attn_out = self.attn_norm(future_out + attn_out)
 
-        # 5. Предсказание
         out = self.post_attn_grn(attn_out)
-        return self.output_layer(out).squeeze(-1) # [B, Horizon]
+        return self.output_layer(out).squeeze(-1) 
 
 
 # ──────────────────────── Датасет ────────────────────────
 
 class TFTWindowDataset(Dataset):
-    def __init__(
-        self, frames, object_ids, scales, static_enc, past_window, horizon, stride=1, is_synthetic=0
-    ):
+    def __init__(self, frames, object_ids, scales, static_enc, past_window, horizon, stride=1, is_synthetic=0):
         self.object_ids = list(object_ids)
         self.past_window = past_window
         self.horizon = horizon
@@ -227,7 +201,6 @@ class TFTWindowDataset(Dataset):
         self.frames_np = []
         self.covariates_np = []
 
-        # Извлекаем статику и упорядочиваем по object_ids
         obj_to_idx = {obj: i for i, obj in enumerate(static_enc["object_ids"])}
         indices = [obj_to_idx[obj] for obj in self.object_ids]
         self.static_cat = static_enc["categorical"][indices].astype(np.int64)
@@ -280,7 +253,6 @@ class TFTWindowDataset(Dataset):
             else:
                 seasonal_values = np.full(self.horizon, fallback_mean)
 
-        # Подготовка тензоров
         x_past_y = (np.log1p(history) / scale_log).reshape(-1, 1)
         x_past_cov = cov_np[h_start:h_end]
         x_past = np.concatenate([x_past_y, x_past_cov], axis=1)
@@ -288,7 +260,6 @@ class TFTWindowDataset(Dataset):
         seasonal_hint = (np.log1p(seasonal_values) / scale_log).reshape(-1, 1)
         x_future_cov = cov_np[t_start:t_end]
         x_future = np.concatenate([x_future_cov, seasonal_hint], axis=1)
-
         y_target = np.log1p(target) / scale_log
 
         return (
@@ -433,7 +404,6 @@ def predict_tft_batch(model, history_frame, target_index, scales, static_enc, cf
     device = resolve_device(cfg.device)
     model.eval()
 
-    # Подготовка статики
     obj_to_idx = {obj: i for i, obj in enumerate(static_enc["object_ids"])}
     indices = [obj_to_idx[obj] for obj in object_ids]
     static_cat = static_enc["categorical"][indices]
@@ -455,13 +425,11 @@ def predict_tft_batch(model, history_frame, target_index, scales, static_enc, cf
 
     scale_logs = np.log1p(np.asarray([scales[oid] for oid in object_ids], dtype=np.float32)).reshape(-1, 1)
 
-    # Past Tensors
     y_past = np.log1p(values) / scale_logs
     cov_past = make_time_covariates(history_index, is_synthetic=0).values.astype(np.float32)
     cov_past = np.broadcast_to(cov_past[None, :, :], (len(object_ids), cfg.past_window, cov_past.shape[1]))
     x_past = np.concatenate([y_past[:, :, None], cov_past], axis=2)
 
-    # Future Tensors
     horizon = len(target_index)
     if cfg.past_window >= 24:
         s_start, s_end = cfg.past_window - 24, min(cfg.past_window - 24 + horizon, cfg.past_window)
@@ -504,7 +472,7 @@ def _eval_starts(n_hours, train_hours, horizon, step_hours, max_eval_windows=Non
 
 
 def run_tft_fast_experiment(
-    pivot_df, horizons=(1, 24), train_modes=("real_only", "real_plus_synth"),
+    pivot_df, static_enc, horizons=(1, 24), train_modes=("real_only", "real_plus_synth"),
     synth_days=30, train_hours=96, eval_step_1h=1, eval_step_24h=24,
     max_eval_windows_1h=None, max_eval_windows_24h=None, max_objects=None, cfg=None
 ):
@@ -516,10 +484,6 @@ def run_tft_fast_experiment(
     object_ids = list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     pivot_df = pivot_df[object_ids]
     train_real = pivot_df.iloc[:train_hours]
-
-    # Инициализация статики
-    static_df = build_static_covariates(pivot_df, object_ids=object_ids)
-    static_enc = encode_static_covariates(static_df)
 
     rows, histories, synth_validation_rows = [], [], []
 
@@ -578,16 +542,13 @@ def run_tft_fast_experiment(
 
 
 def run_tft_backtest(
-    pivot_df, horizon, train_modes=("real_only", "real_plus_synth"),
+    pivot_df, static_enc, horizon, train_modes=("real_only", "real_plus_synth"),
     synth_days=30, min_train_hours=None, step_hours=None, max_folds=None, max_objects=None, cfg=None
 ):
     cfg = cfg or TFTTrainConfig()
     pivot_df = pivot_df.sort_index()
     object_ids = list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     pivot_df = pivot_df[object_ids]
-
-    static_df = build_static_covariates(pivot_df, object_ids=object_ids)
-    static_enc = encode_static_covariates(static_df)
 
     prepended_synth = None
     if "real_plus_synth" in train_modes:
