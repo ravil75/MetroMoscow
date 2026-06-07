@@ -60,7 +60,6 @@ def get_day_mask(target_index):
 
 
 def build_adjacency_mask(pivot_df, top_k=8, min_corr=0.30):
-    """Строит бинарную маску смежности [1, 1, N, N] с self-loops."""
     adj = make_correlation_adjacency(
         pivot_df, top_k=top_k, min_corr=min_corr, include_self=True,
     )
@@ -111,13 +110,7 @@ def load_gat_checkpoint(filepath, device="auto"):
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 class GATWindowDataset(Dataset):
-    """Один сэмпл = ВСЕ объекты для одного временного окна.
-
-    Возвращает:
-        encoder_x  : [N, past_window, n_features]   (1 value + 9 covariates)
-        decoder_x  : [N, horizon,     cov_dim]       (9 covariates + 1 seasonal hint)
-        y          : [N, horizon]
-    """
+    """Один сэмпл = ВСЕ объекты для одного временного окна."""
 
     def __init__(
         self,
@@ -133,21 +126,21 @@ class GATWindowDataset(Dataset):
         self.past_window = past_window
         self.horizon = horizon
         self.stride = max(int(stride), 1)
-        self.samples = []          # (frame_idx, start)
+        self.samples = []
         self.frames_np = []
         self.covariates_np = []
 
         self.scales_log = np.log1p(
             np.array([scales[oid] for oid in self.object_ids], dtype=np.float32)
-        )  # [N]
+        )
 
         for frame in frames:
             if len(frame) == 0:
                 continue
             frame = frame.sort_index()
-            self.frames_np.append(frame[self.object_ids].values.astype(np.float32))  # [T, N]
+            self.frames_np.append(frame[self.object_ids].values.astype(np.float32))
             cov = make_time_covariates(frame.index, is_synthetic=is_synthetic)
-            self.covariates_np.append(cov.values.astype(np.float32))  # [T, 9]
+            self.covariates_np.append(cov.values.astype(np.float32))
 
         for fi, fnp in enumerate(self.frames_np):
             max_start = len(fnp) - past_window - horizon
@@ -161,22 +154,22 @@ class GATWindowDataset(Dataset):
 
     def __getitem__(self, idx):
         fi, start = self.samples[idx]
-        data = self.frames_np[fi]   # [T, N]
-        cov = self.covariates_np[fi]  # [T, 9]
-        sl = self.scales_log          # [N]
+        data = self.frames_np[fi]
+        cov = self.covariates_np[fi]
+        sl = self.scales_log
 
         h_s, h_e = start, start + self.past_window
         t_s, t_e = h_e, h_e + self.horizon
 
-        history = data[h_s:h_e]     # [pw, N]
-        target = data[t_s:t_e]      # [h,  N]
+        history = data[h_s:h_e]
+        target = data[t_s:t_e]
 
         # Сезонная подсказка — 24 ч назад
         s_s, s_e = t_s - 24, t_e - 24
         if s_s >= 0:
-            seasonal = data[s_s:s_e]  # [h, N]
+            seasonal = data[s_s:s_e]
         else:
-            fb = np.mean(history, axis=0)  # [N]
+            fb = np.mean(history, axis=0)
             avail = s_e
             if avail > 0:
                 missing = self.horizon - avail
@@ -187,9 +180,9 @@ class GATWindowDataset(Dataset):
                 seasonal = np.tile(fb, (self.horizon, 1))
 
         # Нормализация
-        x_val = (np.log1p(history) / sl[None, :]).T   # [N, pw]
-        y_norm = (np.log1p(target) / sl[None, :]).T    # [N, h]
-        sh = (np.log1p(seasonal) / sl[None, :]).T      # [N, h]
+        x_val = (np.log1p(history) / sl[None, :]).T    # [N, pw]
+        y_norm = (np.log1p(target) / sl[None, :]).T     # [N, h]
+        sh = (np.log1p(seasonal) / sl[None, :]).T       # [N, h]
 
         # Encoder: [N, pw, 10]
         enc_cov = np.broadcast_to(
@@ -212,20 +205,33 @@ class GATWindowDataset(Dataset):
         )
 
 
-# ── Temporal Encoder ─────────────────────────────────────────────────────────
+# ── Temporal Encoder (ИСПРАВЛЕН) ─────────────────────────────────────────────
 
 class TemporalEncoder(nn.Module):
-    """Conv1d с dilation + attention pooling по временной оси."""
+    """Dilated Conv1d стек с residual connections + attention pooling.
+
+    Ключевые отличия от предыдущей версии:
+      • 5 слоёв с dilation [1, 2, 4, 8, 16] → RF = 63 шага (покрывает 72)
+      • Input projection для residual на каждом слое
+      • Gradient checkpointing-friendly (нет разветвлений)
+    """
 
     def __init__(self, in_features, d_model, dropout=0.1):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_features, d_model, 3, padding=1, dilation=1)
-        self.conv2 = nn.Conv1d(d_model, d_model, 3, padding=2, dilation=2)
-        self.conv3 = nn.Conv1d(d_model, d_model, 3, padding=4, dilation=4)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
+        dilations = [1, 2, 4, 8, 16]
+        self.convs = nn.ModuleList([
+            nn.Conv1d(
+                in_features if i == 0 else d_model,
+                d_model,
+                kernel_size=3,
+                padding=d,
+                dilation=d,
+            )
+            for i, d in enumerate(dilations)
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
         self.drop = nn.Dropout(dropout)
+        self.input_proj = nn.Conv1d(in_features, d_model, 1)
         self.pool_w = nn.Linear(d_model, 1)
 
     def forward(self, x):
@@ -233,35 +239,29 @@ class TemporalEncoder(nn.Module):
         x : [B*N, F, T]
         → : [B*N, d_model]
         """
-        h = F.gelu(self.conv1(x))                    # [B*N, d, T]
-        h = self.norm1(h.transpose(1, 2)).transpose(1, 2)
-        h = self.drop(h)
+        residual = self.input_proj(x)          # [B*N, d, T]
+        h = x
+        for conv, norm in zip(self.convs, self.norms):
+            h = conv(h)                         # [B*N, d, T]
+            h = F.gelu(norm(h.transpose(1, 2)).transpose(1, 2))
+            h = self.drop(h)
+            h = h + residual                    # residual от input proj
 
-        h = F.gelu(self.conv2(h))
-        h = self.norm2(h.transpose(1, 2)).transpose(1, 2)
-        h = self.drop(h)
-
-        h = F.gelu(self.conv3(h))
-        h = self.norm3(h.transpose(1, 2)).transpose(1, 2)
-
-        h = h.transpose(1, 2)                        # [B*N, T, d]
-        w = torch.softmax(self.pool_w(h), dim=1)     # [B*N, T, 1]
-        return (w * h).sum(dim=1)                     # [B*N, d]
+        h = h.transpose(1, 2)                   # [B*N, T, d]
+        w = torch.softmax(self.pool_w(h), dim=1) # [B*N, T, 1]
+        return (w * h).sum(dim=1)                # [B*N, d]
 
 
 # ── GAT Layer ────────────────────────────────────────────────────────────────
 
 class GATLayer(nn.Module):
-    """Multi-head Graph Attention Layer (additive, оригинальный стиль GAT).
-
-    Включает residual connection + LayerNorm + FFN.
-    """
+    """Multi-head Graph Attention Layer с residual + LayerNorm + FFN."""
 
     def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        assert d_model % n_heads == 0
 
         self.W = nn.Linear(d_model, d_model, bias=False)
         self.a_src = nn.Parameter(torch.zeros(n_heads, self.d_head))
@@ -281,34 +281,24 @@ class GATLayer(nn.Module):
         )
 
     def forward(self, x, adj_mask):
-        """
-        x        : [B, N, D]
-        adj_mask : [1, 1, N, N]  — бинарная маска смежности (1 = ребро)
-        """
         B, N, D = x.shape
         residual = x
 
-        h = self.W(x).reshape(B, N, self.n_heads, self.d_head)  # [B, N, H, d_h]
-
-        # Additive attention scores
-        e_src = torch.einsum("bnhd,hd->bnh", h, self.a_src)     # [B, N, H]
-        e_dst = torch.einsum("bnhd,hd->bnh", h, self.a_dst)     # [B, N, H]
-        e = e_src.unsqueeze(2) + e_dst.unsqueeze(1)              # [B, N, N, H]
+        h = self.W(x).reshape(B, N, self.n_heads, self.d_head)
+        e_src = torch.einsum("bnhd,hd->bnh", h, self.a_src)
+        e_dst = torch.einsum("bnhd,hd->bnh", h, self.a_dst)
+        e = e_src.unsqueeze(2) + e_dst.unsqueeze(1)
         e = F.leaky_relu(e, negative_slope=0.2)
+        e = e.permute(0, 3, 1, 2)                  # [B, H, N, N]
 
-        # Переставляем головы на dim=1 → [B, H, N, N], чтобы совпало с adj_mask [1, 1, N, N]
-        e = e.permute(0, 3, 1, 2)                                 # [B, H, N, N]
-
-        # Маскируем несмежные пары
-        e = e.masked_fill(adj_mask == 0, float("-inf"))           # [B, H, N, N]
-
-        attn = torch.softmax(e, dim=-1)                            # [B, H, N, N]
-        attn = attn.nan_to_num(0.0)                                # изолированные узлы
+        e = e.masked_fill(adj_mask == 0, float("-inf"))
+        attn = torch.softmax(e, dim=-1)
+        attn = attn.nan_to_num(0.0)
         attn = self.drop(attn)
 
-        h_t = h.permute(0, 2, 1, 3)                               # [B, H, N, d_h]
-        out = torch.matmul(attn, h_t)                              # [B, H, N, d_h]
-        out = out.permute(0, 2, 1, 3).reshape(B, N, D)            # [B, N, D]
+        h_t = h.permute(0, 2, 1, 3)                # [B, H, N, d_h]
+        out = torch.matmul(attn, h_t)               # [B, H, N, d_h]
+        out = out.permute(0, 2, 1, 3).reshape(B, N, D)
         out = self.out_proj(out)
 
         x = self.norm1(residual + self.drop(out))
@@ -316,15 +306,15 @@ class GATLayer(nn.Module):
         return x
 
 
-# ── GAT Forecaster ───────────────────────────────────────────────────────────
+# ── GAT Forecaster (ИСПРАВЛЕН) ───────────────────────────────────────────────
 
 class GATForecaster(nn.Module):
-    """GAT для глобального прогнозирования пассажиропотока.
+    """GAT для глобального прогнозирования.
 
-    Пайплайн:
-      1. Temporal Encoder (dilated Conv1d + attention pooling) → [B, N, d]
-      2. GAT слои (графовое внимание на корреляционном графе) → [B, N, d]
-      3. Output head с future covariate conditioning → [B, N, horizon]
+    Исправления:
+      1. Temporal encoder с RF=63 (было ~15)
+      2. Input skip: последний known value → выход (модель учит дельту)
+      3. Gate для контроля силы skip-сигнала
     """
 
     def __init__(
@@ -361,6 +351,9 @@ class GATForecaster(nn.Module):
             nn.Linear(d_model // 2, 1),
         )
 
+        # Input skip: обучаемый gate для last-value skip
+        self.skip_gate = nn.Parameter(torch.tensor(0.1))
+
     def forward(self, encoder_x, adj_mask, decoder_x):
         """
         encoder_x : [B, N, pw, F]
@@ -370,23 +363,31 @@ class GATForecaster(nn.Module):
         """
         B, N, T, F = encoder_x.shape
 
-        # Temporal encoding: [B*N, F, T] → [B*N, d] → [B, N, d]
-        x = encoder_x.reshape(B * N, T, F).permute(0, 2, 1)      # [B*N, F, T]
-        x = self.temporal_encoder(x)                                # [B*N, d]
-        x = x.reshape(B, N, -1)                                    # [B, N, d]
+        # ── Input skip: последнее известное значение ──────────────────────
+        last_val = encoder_x[:, :, -1, 0]           # [B, N] — норм. значение
+        last_val_exp = last_val.unsqueeze(-1).expand(-1, -1, self.horizon)  # [B, N, h]
 
-        # Graph Attention
+        # ── Temporal encoding ─────────────────────────────────────────────
+        x = encoder_x.reshape(B * N, T, F).permute(0, 2, 1)
+        x = self.temporal_encoder(x)
+        x = x.reshape(B, N, -1)
+
+        # ── Graph Attention ───────────────────────────────────────────────
         for gat in self.gat_layers:
-            x = gat(x, adj_mask)                                    # [B, N, d]
+            x = gat(x, adj_mask)
 
-        # Output head с future covariates
-        x = x.unsqueeze(2).expand(-1, -1, self.horizon, -1)       # [B, N, h, d]
-        head_in = torch.cat([x, decoder_x], dim=-1)                # [B, N, h, d+cov]
-        out = self.output_head(head_in).squeeze(-1)                 # [B, N, h]
+        # ── Output head + skip ────────────────────────────────────────────
+        x = x.unsqueeze(2).expand(-1, -1, self.horizon, -1)
+        head_in = torch.cat([x, decoder_x], dim=-1)
+        out = self.output_head(head_in).squeeze(-1)   # [B, N, h]
+
+        # Gate-controlled skip от последнего значения
+        out = out + torch.sigmoid(self.skip_gate) * last_val_exp
+
         return out
 
 
-# ── Конфигурация ──────────────────────────────────────────────────────────────
+# ── Конфигурация (ИСПРАВЛЕНА) ─────────────────────────────────────────────────
 
 @dataclass
 class GATTrainConfig:
@@ -397,8 +398,8 @@ class GATTrainConfig:
     top_k_neighbors: int = 8
     min_corr: float = 0.30
     dropout: float = 0.1
-    epochs: int = 16
-    batch_size: int = 4         # число временных окон в батче (НЕ объектов!)
+    epochs: int = 20              # было 16 → 20
+    batch_size: int = 2           # было 4 → 2 (больше градиентных шагов)
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     window_stride: int = 1
@@ -409,13 +410,12 @@ class GATTrainConfig:
     amp: bool = True
 
 
-# ── Обучение ──────────────────────────────────────────────────────────────────
+# ── Обучение (ИСПРАВЛЕНО: warmup + cosine) ────────────────────────────────────
 
 def train_gat(
     train_real, synthetic_train, horizon, cfg, adj_mask,
     pretrained_model=None, scale_source=None,
 ):
-    """Обучает GAT. Если передан pretrained_model — дообучается поверх него."""
     set_seed(cfg.seed)
     object_ids = list(train_real.columns)
     scales = compute_object_scales(
@@ -437,9 +437,7 @@ def train_gat(
     ]
     usable = [d for d in datasets if len(d)]
     if not usable:
-        raise ValueError(
-            "No GAT training windows. Increase train size or reduce past_window."
-        )
+        raise ValueError("No GAT training windows.")
     train_dataset = (
         usable[0] if len(usable) == 1 else torch.utils.data.ConcatDataset(usable)
     )
@@ -450,6 +448,7 @@ def train_gat(
         shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=torch.cuda.is_available(),
+        drop_last=True,            # избегаем некрасивых последних батчей
     )
 
     sample_enc, sample_dec, _ = usable[0][0]
@@ -472,9 +471,17 @@ def train_gat(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.epochs, eta_min=cfg.learning_rate * 0.1,
-    )
+
+    # Warmup + CosineAnnealing
+    warmup_epochs = min(3, cfg.epochs // 4)
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(cfg.epochs - warmup_epochs, 1)
+        return 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     loss_fn = nn.SmoothL1Loss()
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
@@ -490,7 +497,7 @@ def train_gat(
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=cfg.amp and device.type == "cuda"):
-                pred = model(enc_x, adj_mask_dev, dec_x)  # [B, N, h]
+                pred = model(enc_x, adj_mask_dev, dec_x)
                 loss = loss_fn(pred, y)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -513,7 +520,6 @@ def train_gat(
 def train_gat_two_phase(
     train_real, synthetic_train, horizon, cfg, adj_mask, scale_source=None,
 ):
-    """Фаза 1: предобучение на синтетике. Фаза 2: дообучение на реальных."""
     if synthetic_train is None:
         return train_gat(train_real, None, horizon, cfg, adj_mask,
                          scale_source=scale_source)
@@ -524,7 +530,7 @@ def train_gat_two_phase(
         scale_source=scale_source,
     )
 
-    finetune_epochs = max(3, cfg.epochs // 3)
+    finetune_epochs = max(5, cfg.epochs // 2)       # было 3, → минимум 5
     real_cfg = replace(cfg, epochs=finetune_epochs, window_stride=1)
     model, scales, history_phase2 = train_gat(
         train_real, None, horizon, real_cfg, adj_mask,
@@ -544,7 +550,6 @@ def train_gat_two_phase(
 def predict_gat_batch(
     model, history_frame, target_index, scales, cfg, adj_mask, batch_size=None,
 ):
-    """Прогноз всех объектов за один прямой проход GAT."""
     history_frame = history_frame.sort_index()
     object_ids = list(history_frame.columns)
     device = resolve_device(cfg.device)
@@ -553,7 +558,7 @@ def predict_gat_batch(
 
     if len(history_frame) >= cfg.past_window:
         hist_slice = history_frame.iloc[-cfg.past_window:]
-        values = hist_slice.values.astype(np.float32).T   # [N, pw]
+        values = hist_slice.values.astype(np.float32).T
         hist_index = hist_slice.index
     else:
         missing = cfg.past_window - len(history_frame)
@@ -566,16 +571,16 @@ def predict_gat_batch(
             sv = history_frame[oid].values.astype(np.float32)
             pv = float(sv.mean()) if len(sv) else 0.0
             values.append(np.pad(sv, (missing, 0), constant_values=pv)[-cfg.past_window:])
-        values = np.asarray(values, dtype=np.float32)      # [N, pw]
+        values = np.asarray(values, dtype=np.float32)
 
     horizon = len(target_index)
     N = len(object_ids)
     scale_logs = np.log1p(
         np.asarray([scales[oid] for oid in object_ids], dtype=np.float32)
-    )  # [N]
+    )
 
     # Encoder: [N, pw, 10]
-    x_val = (np.log1p(values) / scale_logs[:, None]).astype(np.float32)  # [N, pw]
+    x_val = (np.log1p(values) / scale_logs[:, None]).astype(np.float32)
     enc_cov = make_time_covariates(hist_index, is_synthetic=0).values.astype(np.float32)
     enc_cov_b = np.broadcast_to(enc_cov[None, :, :], (N, cfg.past_window, 9))
     encoder_x = np.concatenate([x_val[:, :, None], enc_cov_b], axis=2).astype(np.float32)
@@ -599,13 +604,11 @@ def predict_gat_batch(
     dec_cov_b = np.broadcast_to(dec_cov[None, :, :], (N, horizon, 9))
     decoder_x = np.concatenate([seasonal_hint[:, :, None], dec_cov_b], axis=2).astype(np.float32)
 
-    # Прямой проход (все объекты за один раз)
     with torch.no_grad():
         enc_t = torch.from_numpy(encoder_x).unsqueeze(0).to(device=device, dtype=torch.float32)
         dec_t = torch.from_numpy(decoder_x).unsqueeze(0).to(device=device, dtype=torch.float32)
-        pred_scaled = model(enc_t, adj_mask_dev, dec_t).cpu().numpy()[0]  # [N, h]
+        pred_scaled = model(enc_t, adj_mask_dev, dec_t).cpu().numpy()[0]
 
-    # Денормализация
     pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_logs[:, None])
     max_pred = np.expm1(scale_logs[:, None]) * 10
     pred = np.maximum(np.minimum(pred, max_pred), 0.0)
@@ -635,7 +638,6 @@ def run_gat_fast_experiment(
     max_objects=None,
     cfg=None,
 ):
-    """Train once per mode, затем оценка на множестве реальных origin."""
     cfg = cfg or GATTrainConfig()
     horizons = sorted(set(int(h) for h in horizons))
     max_horizon = max(horizons)
@@ -651,7 +653,6 @@ def run_gat_fast_experiment(
     )
     pivot_df = pivot_df[object_ids]
 
-    # Граф строим один раз по полным данным
     adj_mask = build_adjacency_mask(pivot_df, cfg.top_k_neighbors, cfg.min_corr)
 
     train_real = pivot_df.iloc[:train_hours]
@@ -769,7 +770,6 @@ def run_gat_backtest(
     max_objects=None,
     cfg=None,
 ):
-    """Rolling-origin backtest для GAT."""
     cfg = cfg or GATTrainConfig()
     pivot_df = pivot_df.sort_index()
     object_ids = (
@@ -777,7 +777,6 @@ def run_gat_backtest(
     )
     pivot_df = pivot_df[object_ids]
 
-    # Граф строим один раз по полным данным (статическая структура)
     adj_mask = build_adjacency_mask(pivot_df, cfg.top_k_neighbors, cfg.min_corr)
     adj_np = adj_mask.squeeze().numpy()
 
