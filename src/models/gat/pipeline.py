@@ -296,9 +296,11 @@ class GATLayer(nn.Module):
         e = e_src.unsqueeze(2) + e_dst.unsqueeze(1)              # [B, N, N, H]
         e = F.leaky_relu(e, negative_slope=0.2)
 
-        # Маскируем несмежные пары
-        e = e.masked_fill(adj_mask == 0, float("-inf"))           # [B, N, N, H]
+        # Переставляем головы на dim=1 → [B, H, N, N], чтобы совпало с adj_mask [1, 1, N, N]
         e = e.permute(0, 3, 1, 2)                                 # [B, H, N, N]
+
+        # Маскируем несмежные пары
+        e = e.masked_fill(adj_mask == 0, float("-inf"))           # [B, H, N, N]
 
         attn = torch.softmax(e, dim=-1)                            # [B, H, N, N]
         attn = attn.nan_to_num(0.0)                                # изолированные узлы
