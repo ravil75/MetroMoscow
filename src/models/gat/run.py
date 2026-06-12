@@ -48,20 +48,30 @@ def parse_args():
     parser.add_argument("--synth-days", type=int, default=45)
     parser.add_argument("--synthetic-window-stride", type=int, default=12)
 
-    # Архитектура GAT
+    # Архитектура GAT (EgoGAT)
     parser.add_argument("--past-window", type=int, default=72)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--n-gat-layers", type=int, default=2)
     parser.add_argument("--top-k-neighbors", type=int, default=8)
-    parser.add_argument("--min-corr", type=float, default=0.30)
+    parser.add_argument(
+        "--min-corr", type=float, default=0.05,
+        help="Порог residual-корреляции для рёбер ego-графа.",
+    )
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--neighbor-dropout", type=float, default=0.15,
+        help="Вероятность глушения соседа в пространственном внимании при обучении.",
+    )
+    parser.add_argument(
+        "--night-weight", type=float, default=0.3,
+        help="Вес ночных часов (0-5) в лоссе; метрики считаются по дневным.",
+    )
 
     # Обучение
-    parser.add_argument("--epochs", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument(
-        "--batch-size", type=int, default=4,
-        help="Число временных окон в батче (не объектов!). Для GAT обычно 2–8.",
+        "--batch-size", type=int, default=256,
+        help="Число сэмплов (объект × окно) в батче, как у TFT.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -94,10 +104,11 @@ def main():
         past_window=args.past_window,
         d_model=args.d_model,
         n_heads=args.n_heads,
-        n_gat_layers=args.n_gat_layers,
         top_k_neighbors=args.top_k_neighbors,
         min_corr=args.min_corr,
         dropout=args.dropout,
+        neighbor_dropout=args.neighbor_dropout,
+        night_weight=args.night_weight,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
