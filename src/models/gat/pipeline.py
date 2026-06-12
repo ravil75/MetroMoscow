@@ -1,3 +1,4 @@
+import math
 import random
 from dataclasses import dataclass, replace
 
@@ -65,7 +66,7 @@ def build_adjacency_mask(pivot_df, top_k=8, min_corr=0.30):
     )
     mask = (adj.values > 0).astype(np.float32)
     np.fill_diagonal(mask, 1.0)
-    return torch.from_numpy(mask).unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
+    return torch.from_numpy(mask).unsqueeze(0).unsqueeze(0)
 
 
 # ── Чекпойнты ────────────────────────────────────────────────────────────────
@@ -107,20 +108,11 @@ def load_gat_checkpoint(filepath, device="auto"):
     return model, checkpoint["scales"], cfg, adj_mask
 
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+# ── Dataset (Пункт 6: защита past_window < 24, Пункт 10: rename history) ──────
 
 class GATWindowDataset(Dataset):
-    """Один сэмпл = ВСЕ объекты для одного временного окна."""
-
     def __init__(
-        self,
-        frames,
-        object_ids,
-        scales,
-        past_window,
-        horizon,
-        stride=1,
-        is_synthetic=0,
+        self, frames, object_ids, scales, past_window, horizon, stride=1, is_synthetic=0,
     ):
         self.object_ids = list(object_ids)
         self.past_window = past_window
@@ -135,8 +127,7 @@ class GATWindowDataset(Dataset):
         )
 
         for frame in frames:
-            if len(frame) == 0:
-                continue
+            if len(frame) == 0: continue
             frame = frame.sort_index()
             self.frames_np.append(frame[self.object_ids].values.astype(np.float32))
             cov = make_time_covariates(frame.index, is_synthetic=is_synthetic)
@@ -144,8 +135,7 @@ class GATWindowDataset(Dataset):
 
         for fi, fnp in enumerate(self.frames_np):
             max_start = len(fnp) - past_window - horizon
-            if max_start < 0:
-                continue
+            if max_start < 0: continue
             for s in range(0, max_start + 1, self.stride):
                 self.samples.append((fi, s))
 
@@ -161,41 +151,33 @@ class GATWindowDataset(Dataset):
         h_s, h_e = start, start + self.past_window
         t_s, t_e = h_e, h_e + self.horizon
 
-        history = data[h_s:h_e]
+        hist_vals = data[h_s:h_e]
         target = data[t_s:t_e]
 
-        # Сезонная подсказка — 24 ч назад
-        s_s, s_e = t_s - 24, t_e - 24
-        if s_s >= 0:
-            seasonal = data[s_s:s_e]
-        else:
-            fb = np.mean(history, axis=0)
-            avail = s_e
-            if avail > 0:
-                missing = self.horizon - avail
-                seasonal = np.concatenate(
-                    [np.tile(fb, (missing, 1)), data[0:avail]], axis=0
-                )
-            else:
-                seasonal = np.tile(fb, (self.horizon, 1))
+        # Безопасная сезонная подсказка
+        last_k = min(24, self.past_window)
+        last_24_history = hist_vals[-last_k:]
+        if last_24_history.shape[0] < 24:
+            pad_width = 24 - last_k
+            # Заполняем левую часть средним значением первой строки периода
+            pad = np.tile(last_24_history[:1], (pad_width, 1))
+            last_24_history = np.concatenate([pad, last_24_history], axis=0)
 
-        # Нормализация
-        x_val = (np.log1p(history) / sl[None, :]).T    # [N, pw]
-        y_norm = (np.log1p(target) / sl[None, :]).T     # [N, h]
-        sh = (np.log1p(seasonal) / sl[None, :]).T       # [N, h]
+        reps = (self.horizon // 24) + 1
+        seasonal = np.tile(last_24_history, (reps, 1))[:self.horizon]
 
-        # Encoder: [N, pw, 10]
+        x_val = (np.log1p(hist_vals) / sl[None, :]).T
+        y_norm = (np.log1p(target) / sl[None, :]).T
+        sh = (np.log1p(seasonal) / sl[None, :]).T
+
         enc_cov = np.broadcast_to(
-            cov[h_s:h_e][None, :, :],
-            (len(self.object_ids), self.past_window, 9),
-        )
+            cov[h_s:h_e][None, :, :], (len(self.object_ids), self.past_window, 9)
+        ).copy()
         encoder_x = np.concatenate([x_val[:, :, None], enc_cov], axis=2)
 
-        # Decoder: [N, h, 10]
         dec_cov = np.broadcast_to(
-            cov[t_s:t_e][None, :, :],
-            (len(self.object_ids), self.horizon, 9),
-        )
+            cov[t_s:t_e][None, :, :], (len(self.object_ids), self.horizon, 9)
+        ).copy()
         decoder_x = np.concatenate([sh[:, :, None], dec_cov], axis=2)
 
         return (
@@ -205,58 +187,36 @@ class GATWindowDataset(Dataset):
         )
 
 
-# ── Temporal Encoder (ИСПРАВЛЕН) ─────────────────────────────────────────────
+# ── Temporal Encoder ─────────────────────────────────────────────────────────
 
 class TemporalEncoder(nn.Module):
-    """Dilated Conv1d стек с residual connections + attention pooling.
-
-    Ключевые отличия от предыдущей версии:
-      • 5 слоёв с dilation [1, 2, 4, 8, 16] → RF = 63 шага (покрывает 72)
-      • Input projection для residual на каждом слое
-      • Gradient checkpointing-friendly (нет разветвлений)
-    """
-
     def __init__(self, in_features, d_model, dropout=0.1):
         super().__init__()
         dilations = [1, 2, 4, 8, 16]
+        self.input_proj = nn.Conv1d(in_features, d_model, 1)
         self.convs = nn.ModuleList([
-            nn.Conv1d(
-                in_features if i == 0 else d_model,
-                d_model,
-                kernel_size=3,
-                padding=d,
-                dilation=d,
-            )
-            for i, d in enumerate(dilations)
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=d, dilation=d) for d in dilations
         ])
         self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
         self.drop = nn.Dropout(dropout)
-        self.input_proj = nn.Conv1d(in_features, d_model, 1)
         self.pool_w = nn.Linear(d_model, 1)
 
     def forward(self, x):
-        """
-        x : [B*N, F, T]
-        → : [B*N, d_model]
-        """
-        residual = self.input_proj(x)          # [B*N, d, T]
-        h = x
+        h = self.input_proj(x)
         for conv, norm in zip(self.convs, self.norms):
-            h = conv(h)                         # [B*N, d, T]
+            residual = h
+            h = conv(h)
             h = F.gelu(norm(h.transpose(1, 2)).transpose(1, 2))
             h = self.drop(h)
-            h = h + residual                    # residual от input proj
+            h = h + residual
+        h = h.transpose(1, 2)
+        w = torch.softmax(self.pool_w(h), dim=1)
+        return (w * h).sum(dim=1)
 
-        h = h.transpose(1, 2)                   # [B*N, T, d]
-        w = torch.softmax(self.pool_w(h), dim=1) # [B*N, T, 1]
-        return (w * h).sum(dim=1)                # [B*N, d]
 
-
-# ── GAT Layer ────────────────────────────────────────────────────────────────
+# ── GAT Layer (Пункт 8: масштабирование внимания) ──────────────────────────────
 
 class GATLayer(nn.Module):
-    """Multi-head Graph Attention Layer с residual + LayerNorm + FFN."""
-
     def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
@@ -264,68 +224,56 @@ class GATLayer(nn.Module):
         assert d_model % n_heads == 0
 
         self.W = nn.Linear(d_model, d_model, bias=False)
-        self.a_src = nn.Parameter(torch.zeros(n_heads, self.d_head))
-        self.a_dst = nn.Parameter(torch.zeros(n_heads, self.d_head))
-        nn.init.xavier_uniform_(self.a_src.unsqueeze(0))
-        nn.init.xavier_uniform_(self.a_dst.unsqueeze(0))
+        self.a_src = nn.Parameter(torch.empty(n_heads, self.d_head))
+        self.a_dst = nn.Parameter(torch.empty(n_heads, self.d_head))
+        nn.init.normal_(self.a_src, std=0.02)
+        nn.init.normal_(self.a_dst, std=0.02)
 
         self.out_proj = nn.Linear(d_model, d_model)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.drop = nn.Dropout(dropout)
+        
+        self.drop_attn = nn.Dropout(dropout)
+        self.drop_proj = nn.Dropout(dropout)
+        
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
+            nn.Linear(d_model, d_model * 2), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(d_model * 2, d_model),
         )
 
-    def forward(self, x, adj_mask):
+    def forward(self, x, mask_neg):
         B, N, D = x.shape
         residual = x
-
         h = self.W(x).reshape(B, N, self.n_heads, self.d_head)
         e_src = torch.einsum("bnhd,hd->bnh", h, self.a_src)
         e_dst = torch.einsum("bnhd,hd->bnh", h, self.a_dst)
-        e = e_src.unsqueeze(2) + e_dst.unsqueeze(1)
+        
+        # Пункт 8: масштабирование 1/sqrt(d_head) для стабильности градиентов
+        e = (e_src.unsqueeze(2) + e_dst.unsqueeze(1)) / math.sqrt(self.d_head)
         e = F.leaky_relu(e, negative_slope=0.2)
-        e = e.permute(0, 3, 1, 2)                  # [B, H, N, N]
-
-        e = e.masked_fill(adj_mask == 0, float("-inf"))
+        
+        e = e.permute(0, 3, 1, 2)
+        e = e + mask_neg
+        
         attn = torch.softmax(e, dim=-1)
-        attn = attn.nan_to_num(0.0)
-        attn = self.drop(attn)
+        attn = self.drop_attn(attn)
 
-        h_t = h.permute(0, 2, 1, 3)                # [B, H, N, d_h]
-        out = torch.matmul(attn, h_t)               # [B, H, N, d_h]
+        h_t = h.permute(0, 2, 1, 3)
+        out = torch.matmul(attn, h_t)
         out = out.permute(0, 2, 1, 3).reshape(B, N, D)
         out = self.out_proj(out)
 
-        x = self.norm1(residual + self.drop(out))
+        x = self.norm1(residual + self.drop_proj(out))
         x = self.norm2(x + self.ffn(x))
         return x
 
 
-# ── GAT Forecaster (ИСПРАВЛЕН) ───────────────────────────────────────────────
+# ── GAT Forecaster (Пункт 2: .contiguous()) ───────────────────────────────────
 
 class GATForecaster(nn.Module):
-    """GAT для глобального прогнозирования.
-
-    Исправления:
-      1. Temporal encoder с RF=63 (было ~15)
-      2. Input skip: последний known value → выход (модель учит дельту)
-      3. Gate для контроля силы skip-сигнала
-    """
-
     def __init__(
-        self,
-        in_features: int = 10,
-        future_cov_dim: int = 10,
-        d_model: int = 128,
-        n_heads: int = 4,
-        n_gat_layers: int = 2,
-        horizon: int = 24,
-        dropout: float = 0.1,
+        self, in_features=10, future_cov_dim=10, d_model=128, n_heads=4, 
+        n_gat_layers=2, horizon=24, dropout=0.1,
     ):
         super().__init__()
         self.in_features = in_features
@@ -335,59 +283,45 @@ class GATForecaster(nn.Module):
         self.n_gat_layers = n_gat_layers
 
         self.temporal_encoder = TemporalEncoder(in_features, d_model, dropout)
-
-        self.gat_layers = nn.ModuleList([
-            GATLayer(d_model, n_heads, dropout)
-            for _ in range(n_gat_layers)
-        ])
+        self.gat_layers = nn.ModuleList([GATLayer(d_model, n_heads, dropout) for _ in range(n_gat_layers)])
 
         self.output_head = nn.Sequential(
-            nn.Linear(d_model + future_cov_dim, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Linear(d_model + future_cov_dim, d_model), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_model // 2, 1),
         )
+        self.skip_gate_proj = nn.Linear(d_model + 1, 1)
 
-        # Input skip: обучаемый gate для last-value skip
-        self.skip_gate = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, encoder_x, adj_mask, decoder_x):
-        """
-        encoder_x : [B, N, pw, F]
-        adj_mask  : [1, 1, N, N]
-        decoder_x : [B, N, h,  cov_dim]
-        returns   : [B, N, h]
-        """
+    def forward(self, encoder_x, mask_neg, decoder_x):
         B, N, T, F = encoder_x.shape
+        
+        last_val = encoder_x[:, :, -1, 0]
+        last_val_exp = last_val.unsqueeze(-1).expand(-1, -1, self.horizon)
 
-        # ── Input skip: последнее известное значение ──────────────────────
-        last_val = encoder_x[:, :, -1, 0]           # [B, N] — норм. значение
-        last_val_exp = last_val.unsqueeze(-1).expand(-1, -1, self.horizon)  # [B, N, h]
-
-        # ── Temporal encoding ─────────────────────────────────────────────
         x = encoder_x.reshape(B * N, T, F).permute(0, 2, 1)
         x = self.temporal_encoder(x)
         x = x.reshape(B, N, -1)
 
-        # ── Graph Attention ───────────────────────────────────────────────
         for gat in self.gat_layers:
-            x = gat(x, adj_mask)
+            x = gat(x, mask_neg)
 
-        # ── Output head + skip ────────────────────────────────────────────
-        x = x.unsqueeze(2).expand(-1, -1, self.horizon, -1)
-        head_in = torch.cat([x, decoder_x], dim=-1)
-        out = self.output_head(head_in).squeeze(-1)   # [B, N, h]
+        # Пункт 2: .contiguous() избегает двойной аллокации памяти при torch.cat
+        x_exp = x.unsqueeze(2).expand(-1, -1, self.horizon, -1).contiguous()
+        
+        pos = torch.linspace(0, 1, self.horizon, device=x.device)
+        pos = pos.view(1, 1, -1, 1).expand(B, N, -1, 1)
+        
+        gate_in = torch.cat([x_exp, pos], dim=-1)
+        gate = torch.sigmoid(self.skip_gate_proj(gate_in).squeeze(-1))
 
-        # Gate-controlled skip от последнего значения
-        out = out + torch.sigmoid(self.skip_gate) * last_val_exp
+        head_in = torch.cat([x_exp, decoder_x], dim=-1)
+        out = self.output_head(head_in).squeeze(-1)
 
+        out = out + gate * last_val_exp
         return out
 
 
-# ── Конфигурация (ИСПРАВЛЕНА) ─────────────────────────────────────────────────
+# ── Конфигурация ──────────────────────────────────────────────────────────────
 
 @dataclass
 class GATTrainConfig:
@@ -398,8 +332,8 @@ class GATTrainConfig:
     top_k_neighbors: int = 8
     min_corr: float = 0.30
     dropout: float = 0.1
-    epochs: int = 20              # было 16 → 20
-    batch_size: int = 2           # было 4 → 2 (больше градиентных шагов)
+    epochs: int = 20
+    batch_size: int = 2
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     window_stride: int = 1
@@ -410,17 +344,13 @@ class GATTrainConfig:
     amp: bool = True
 
 
-# ── Обучение (ИСПРАВЛЕНО: warmup + cosine) ────────────────────────────────────
+# ── Обучение (Пункт 4: seed_offset=0, Пункт 9: умный drop_last) ──────────────
 
-def train_gat(
-    train_real, synthetic_train, horizon, cfg, adj_mask,
-    pretrained_model=None, scale_source=None,
-):
-    set_seed(cfg.seed)
+def train_gat(train_real, synthetic_train, horizon, cfg, adj_mask, pretrained_model=None, scale_source=None, seed_offset=0):
+    set_seed(cfg.seed + seed_offset)
+    
     object_ids = list(train_real.columns)
-    scales = compute_object_scales(
-        scale_source if scale_source is not None else train_real
-    )
+    scales = compute_object_scales(scale_source if scale_source is not None else train_real)
 
     frames = [train_real]
     strides = [cfg.window_stride]
@@ -429,67 +359,54 @@ def train_gat(
         strides.append(cfg.synthetic_window_stride)
 
     datasets = [
-        GATWindowDataset(
-            [frame], object_ids, scales, cfg.past_window, horizon,
-            stride=stride, is_synthetic=int(i > 0),
-        )
+        GATWindowDataset([frame], object_ids, scales, cfg.past_window, horizon, stride=stride, is_synthetic=int(i > 0))
         for i, (frame, stride) in enumerate(zip(frames, strides))
     ]
     usable = [d for d in datasets if len(d)]
-    if not usable:
-        raise ValueError("No GAT training windows.")
-    train_dataset = (
-        usable[0] if len(usable) == 1 else torch.utils.data.ConcatDataset(usable)
-    )
-
+    if not usable: raise ValueError("No GAT training windows.")
+    
+    train_dataset = usable[0] if len(usable) == 1 else torch.utils.data.ConcatDataset(usable)
+    effective_bs = max(1, min(cfg.batch_size, len(train_dataset)))
+    
+    # Пункт 9: drop_last=True только если датасет достаточно большой
+    drop_last = len(train_dataset) > effective_bs
+    
     loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,            # избегаем некрасивых последних батчей
+        train_dataset, batch_size=effective_bs, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available(), drop_last=drop_last,
     )
 
     sample_enc, sample_dec, _ = usable[0][0]
     device = resolve_device(cfg.device)
+    
     adj_mask_dev = adj_mask.to(device)
+    mask_neg_dev = (adj_mask_dev == 0).float() * (-1e9)
 
     model = GATForecaster(
-        in_features=sample_enc.shape[-1],
-        future_cov_dim=sample_dec.shape[-1],
-        d_model=cfg.d_model,
-        n_heads=cfg.n_heads,
-        n_gat_layers=cfg.n_gat_layers,
-        horizon=horizon,
-        dropout=cfg.dropout,
+        in_features=sample_enc.shape[-1], future_cov_dim=sample_dec.shape[-1],
+        d_model=cfg.d_model, n_heads=cfg.n_heads, n_gat_layers=cfg.n_gat_layers,
+        horizon=horizon, dropout=cfg.dropout,
     ).to(device)
 
     if pretrained_model is not None:
         model.load_state_dict(pretrained_model.state_dict())
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-    )
-
-    # Warmup + CosineAnnealing
-    warmup_epochs = min(3, cfg.epochs // 4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    
+    warmup_epochs = max(1, min(3, cfg.epochs // 4))
     def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
+        if epoch < warmup_epochs: return (epoch + 1) / warmup_epochs
         progress = (epoch - warmup_epochs) / max(cfg.epochs - warmup_epochs, 1)
         return 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    loss_fn = nn.SmoothL1Loss()
+    loss_fn = nn.SmoothL1Loss(beta=0.5)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     model.train()
     history = []
     for epoch in range(1, cfg.epochs + 1):
-        total_loss = 0.0
-        n_seen = 0
+        total_loss, n_seen = 0.0, 0
         for enc_x, dec_x, y in loader:
             enc_x = enc_x.to(device=device, dtype=torch.float32)
             dec_x = dec_x.to(device=device, dtype=torch.float32)
@@ -497,8 +414,9 @@ def train_gat(
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=cfg.amp and device.type == "cuda"):
-                pred = model(enc_x, adj_mask_dev, dec_x)
+                pred = model(enc_x, mask_neg_dev, dec_x)
                 loss = loss_fn(pred, y)
+            
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -517,44 +435,37 @@ def train_gat(
     return model, scales, history
 
 
-def train_gat_two_phase(
-    train_real, synthetic_train, horizon, cfg, adj_mask, scale_source=None,
-):
+def train_gat_two_phase(train_real, synthetic_train, horizon, cfg, adj_mask, scale_source=None):
     if synthetic_train is None:
-        return train_gat(train_real, None, horizon, cfg, adj_mask,
-                         scale_source=scale_source)
+        # Пункт 4: явно передаём seed_offset=0
+        return train_gat(train_real, None, horizon, cfg, adj_mask, scale_source=scale_source, seed_offset=0)
 
-    synth_cfg = replace(cfg, window_stride=24)
+    synth_cfg = replace(cfg, window_stride=cfg.synthetic_window_stride)
     model, scales, history_phase1 = train_gat(
-        synthetic_train[train_real.columns], None, horizon, synth_cfg, adj_mask,
-        scale_source=scale_source,
+        synthetic_train[train_real.columns], None, horizon, synth_cfg, adj_mask, scale_source=scale_source, seed_offset=0
     )
 
-    finetune_epochs = max(5, cfg.epochs // 2)       # было 3, → минимум 5
+    finetune_epochs = max(5, cfg.epochs // 2)
     real_cfg = replace(cfg, epochs=finetune_epochs, window_stride=1)
     model, scales, history_phase2 = train_gat(
-        train_real, None, horizon, real_cfg, adj_mask,
-        pretrained_model=model, scale_source=scale_source,
+        train_real, None, horizon, real_cfg, adj_mask, pretrained_model=model, scale_source=scale_source, seed_offset=1
     )
 
-    for item in history_phase1:
-        item["phase"] = "synth_pretrain"
-    for item in history_phase2:
-        item["phase"] = "real_finetune"
-
+    for item in history_phase1: item["phase"] = "synth_pretrain"
+    for item in history_phase2: item["phase"] = "real_finetune"
     return model, scales, history_phase1 + history_phase2
 
 
-# ── Инференс ──────────────────────────────────────────────────────────────────
+# ── Инференс (Пункт 7: clip pred_scaled) ──────────────────────────────────────
 
-def predict_gat_batch(
-    model, history_frame, target_index, scales, cfg, adj_mask, batch_size=None,
-):
+def predict_gat_batch(model, history_frame, target_index, scales, cfg, adj_mask, batch_size=None):
     history_frame = history_frame.sort_index()
     object_ids = list(history_frame.columns)
     device = resolve_device(cfg.device)
     model.eval()
+    
     adj_mask_dev = adj_mask.to(device)
+    mask_neg_dev = (adj_mask_dev == 0).float() * (-1e9)
 
     if len(history_frame) >= cfg.past_window:
         hist_slice = history_frame.iloc[-cfg.past_window:]
@@ -562,10 +473,7 @@ def predict_gat_batch(
         hist_index = hist_slice.index
     else:
         missing = cfg.past_window - len(history_frame)
-        hist_index = pd.date_range(
-            end=target_index[0] - pd.Timedelta(hours=1),
-            periods=cfg.past_window, freq="h",
-        )
+        hist_index = pd.date_range(end=target_index[0] - pd.Timedelta(hours=1), periods=cfg.past_window, freq="h")
         values = []
         for oid in object_ids:
             sv = history_frame[oid].values.astype(np.float32)
@@ -575,48 +483,43 @@ def predict_gat_batch(
 
     horizon = len(target_index)
     N = len(object_ids)
-    scale_logs = np.log1p(
-        np.asarray([scales[oid] for oid in object_ids], dtype=np.float32)
-    )
+    scale_logs = np.log1p(np.asarray([scales[oid] for oid in object_ids], dtype=np.float32))
 
-    # Encoder: [N, pw, 10]
     x_val = (np.log1p(values) / scale_logs[:, None]).astype(np.float32)
     enc_cov = make_time_covariates(hist_index, is_synthetic=0).values.astype(np.float32)
-    enc_cov_b = np.broadcast_to(enc_cov[None, :, :], (N, cfg.past_window, 9))
+    enc_cov_b = np.broadcast_to(enc_cov[None, :, :], (N, cfg.past_window, 9)).copy()
     encoder_x = np.concatenate([x_val[:, :, None], enc_cov_b], axis=2).astype(np.float32)
 
-    # Seasonal hint
-    if cfg.past_window >= 24:
-        s_start = cfg.past_window - 24
-        s_end = min(s_start + horizon, cfg.past_window)
-        seasonal_pax = values[:, s_start:s_end]
-        if seasonal_pax.shape[1] < horizon:
-            reps = (horizon // seasonal_pax.shape[1]) + 1
-            seasonal_pax = np.tile(seasonal_pax, (1, reps))[:, :horizon]
-    else:
-        mean_vals = values.mean(axis=1, keepdims=True)
-        seasonal_pax = np.broadcast_to(mean_vals, (N, horizon)).copy()
+    last_k = min(24, values.shape[1])
+    last_24_values = values[:, -last_k:]
+    if last_24_values.shape[1] < 24:
+        pad_width = 24 - last_k
+        pad = np.tile(last_24_values.mean(axis=1, keepdims=True), (1, pad_width))
+        last_24_values = np.concatenate([pad, last_24_values], axis=1)
 
+    reps = (horizon // 24) + 1
+    seasonal_pax = np.tile(last_24_values, (1, reps))[:, :horizon]
     seasonal_hint = (np.log1p(seasonal_pax) / scale_logs[:, None]).astype(np.float32)
 
-    # Decoder: [N, h, 10]
     dec_cov = make_time_covariates(target_index, is_synthetic=0).values.astype(np.float32)
-    dec_cov_b = np.broadcast_to(dec_cov[None, :, :], (N, horizon, 9))
+    dec_cov_b = np.broadcast_to(dec_cov[None, :, :], (N, horizon, 9)).copy()
     decoder_x = np.concatenate([seasonal_hint[:, :, None], dec_cov_b], axis=2).astype(np.float32)
 
     with torch.no_grad():
         enc_t = torch.from_numpy(encoder_x).unsqueeze(0).to(device=device, dtype=torch.float32)
         dec_t = torch.from_numpy(decoder_x).unsqueeze(0).to(device=device, dtype=torch.float32)
-        pred_scaled = model(enc_t, adj_mask_dev, dec_t).cpu().numpy()[0]
+        pred_scaled = model(enc_t, mask_neg_dev, dec_t).cpu().numpy()[0]
 
-    pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_logs[:, None])
-    max_pred = np.expm1(scale_logs[:, None]) * 10
-    pred = np.maximum(np.minimum(pred, max_pred), 0.0)
+    # Пункт 7: защита от переполнения expm1
+    pred_scaled_clipped = np.clip(pred_scaled, -10.0, 10.0)
+    pred = np.expm1(pred_scaled_clipped * scale_logs[:, None])
+    max_pred = np.expm1(scale_logs[:, None]) * 10.0
+    pred = np.clip(pred, 0.0, max_pred)
 
     return pd.DataFrame(pred.T, index=target_index, columns=object_ids)
 
 
-# ── Fast experiment ───────────────────────────────────────────────────────────
+# ── Fast experiment & Rolling backtest ───────────────────────────────────────
 
 def _eval_starts(n_hours, train_hours, horizon, step_hours, max_eval_windows=None):
     starts = list(range(train_hours, n_hours - horizon + 1, step_hours))
@@ -626,42 +529,28 @@ def _eval_starts(n_hours, train_hours, horizon, step_hours, max_eval_windows=Non
 
 
 def run_gat_fast_experiment(
-    pivot_df,
-    horizons=(1, 24),
-    train_modes=("real_only", "real_plus_synth"),
-    synth_days=30,
-    train_hours=96,
-    eval_step_1h=1,
-    eval_step_24h=24,
-    max_eval_windows_1h=None,
-    max_eval_windows_24h=None,
-    max_objects=None,
-    cfg=None,
+    pivot_df, horizons=(1, 24), train_modes=("real_only", "real_plus_synth"),
+    synth_days=30, train_hours=96, eval_step_1h=1, eval_step_24h=24,
+    max_eval_windows_1h=None, max_eval_windows_24h=None, max_objects=None, cfg=None,
 ):
     cfg = cfg or GATTrainConfig()
     horizons = sorted(set(int(h) for h in horizons))
     max_horizon = max(horizons)
-    if train_hours < cfg.past_window + max_horizon:
-        raise ValueError(
-            f"train_hours={train_hours} too small for past_window={cfg.past_window} "
-            f"and max_horizon={max_horizon}."
-        )
+    if train_hours < cfg.past_window + max_horizon: raise ValueError("train_hours too small")
 
     pivot_df = pivot_df.sort_index()
-    object_ids = (
-        list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
-    )
+    object_ids = list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     pivot_df = pivot_df[object_ids]
 
-    adj_mask = build_adjacency_mask(pivot_df, cfg.top_k_neighbors, cfg.min_corr)
-
     train_real = pivot_df.iloc[:train_hours]
-    rows, histories, synth_validation_rows = [], [], []
+    adj_mask = build_adjacency_mask(train_real, cfg.top_k_neighbors, cfg.min_corr)
+    adj_np = adj_mask.squeeze(dim=0).squeeze(dim=0).numpy()
 
+    rows, histories, synth_validation_rows = [], [], []
     synthetic_train = None
     if "real_plus_synth" in train_modes:
         dynamic_days = get_synth_days(len(train_real), base_synth_days=synth_days)
-        print(f"GAT fast: dynamic synth_days={dynamic_days} (train={len(train_real)}h)")
+        print(f"GAT fast: dynamic synth_days={dynamic_days}")
         synthetic_train = synthesize_from_train(
             train_real, gen_days=dynamic_days, seed=cfg.seed + max_horizon * 1000,
         )
@@ -671,114 +560,52 @@ def run_gat_fast_experiment(
 
     for train_mode in train_modes:
         active_synth = synthetic_train if train_mode == "real_plus_synth" else None
-        print(
-            f"GAT fast mode={train_mode} train={len(train_real)}h "
-            f"max_horizon={max_horizon} objects={len(object_ids)}"
-        )
 
         if train_mode == "real_plus_synth":
-            model, scales, history = train_gat_two_phase(
-                train_real, active_synth, max_horizon, cfg, adj_mask,
-            )
+            model, scales, history = train_gat_two_phase(train_real, active_synth, max_horizon, cfg, adj_mask, scale_source=train_real)
         else:
-            model, scales, history = train_gat(
-                train_real, None, max_horizon, cfg, adj_mask,
-            )
+            model, scales, history = train_gat(train_real, None, max_horizon, cfg, adj_mask, scale_source=train_real)
 
-        adj_np = adj_mask.squeeze().numpy()
         model_path = config.OUTPUT_DIR / f"gat_model_fast_{train_mode}_h{max_horizon}.pt"
         save_gat_checkpoint(model, scales, cfg, adj_np, model_path)
 
         for item in history:
-            histories.append({
-                **item,
-                "horizon": max_horizon,
-                "train_mode": train_mode,
-                "model": "GAT",
-                "protocol": "fast_single_train",
-                "train_hours": train_hours,
-            })
+            histories.append({**item, "horizon": max_horizon, "train_mode": train_mode, "model": "GAT", "protocol": "fast_single_train", "train_hours": train_hours})
 
         active_objects = get_active_objects(train_real, object_ids)
-        print(f"  Активных объектов для метрик: {len(active_objects)} / {len(object_ids)}")
 
-        for horizon in horizons:
-            step_hours = (
-                eval_step_1h if horizon == 1
-                else (eval_step_24h if horizon == 24 else horizon)
-            )
-            max_eval = (
-                max_eval_windows_1h if horizon == 1
-                else (max_eval_windows_24h if horizon == 24 else None)
-            )
+        for eval_horizon in horizons:
+            step_hours = eval_step_1h if eval_horizon == 1 else (eval_step_24h if eval_horizon == 24 else eval_horizon)
+            max_eval = max_eval_windows_1h if eval_horizon == 1 else (max_eval_windows_24h if eval_horizon == 24 else None)
 
-            starts = _eval_starts(
-                len(pivot_df), train_hours, horizon, step_hours, max_eval,
-            )
+            starts = _eval_starts(len(pivot_df), train_hours, eval_horizon, step_hours, max_eval)
             for eval_idx, start in enumerate(starts):
-                forecast_index = pd.date_range(
-                    start=pivot_df.index[start], periods=max_horizon, freq="h",
-                )
-                y_true = pivot_df.iloc[start: start + horizon]
+                forecast_index = pd.date_range(start=pivot_df.index[start], periods=max_horizon, freq="h")
+                y_true = pivot_df.iloc[start: start + eval_horizon]
                 history_frame = pivot_df.iloc[:start]
-                pred = predict_gat_batch(
-                    model, history_frame, forecast_index, scales, cfg, adj_mask,
-                ).iloc[:horizon]
+                pred = predict_gat_batch(model, history_frame, forecast_index, scales, cfg, adj_mask).iloc[:eval_horizon]
 
                 day_mask = get_day_mask(y_true.index)
                 for oid in active_objects:
                     yt = y_true[oid].values[day_mask]
                     yp = pred[oid].values[day_mask]
-                    if len(yt) == 0:
-                        continue
-                    row = forecast_metrics(
-                        yt, yp,
-                        model_name="GAT", horizon=horizon, train_mode=train_mode,
-                        object_id=oid, fold=eval_idx,
-                    )
-                    row.update({
-                        "test_start": y_true.index[0],
-                        "test_end": y_true.index[-1],
-                        "train_hours": train_hours,
-                        "test_data": "real",
-                        "protocol": "fast_single_train",
-                    })
+                    if len(yt) == 0: continue
+                    row = forecast_metrics(yt, yp, model_name="GAT", horizon=eval_horizon, train_mode=train_mode, object_id=oid, fold=eval_idx)
+                    row.update({"test_start": y_true.index[0], "test_end": y_true.index[-1], "train_hours": train_hours, "test_data": "real", "protocol": "fast_single_train"})
                     rows.append(row)
 
-            print(
-                f"GAT fast mode={train_mode} h={horizon}: "
-                f"evaluated {len(starts)} real windows"
-            )
-
     results = pd.DataFrame(rows)
-    summary = summarize_results(results)
-    histories = pd.DataFrame(histories)
-    synth_validation = pd.DataFrame(synth_validation_rows)
-    return results, summary, histories, synth_validation
+    return results, summarize_results(results), pd.DataFrame(histories), pd.DataFrame(synth_validation_rows)
 
-
-# ── Rolling backtest ──────────────────────────────────────────────────────────
 
 def run_gat_backtest(
-    pivot_df,
-    horizon,
-    train_modes=("real_only", "real_plus_synth"),
-    synth_days=30,
-    min_train_hours=None,
-    step_hours=None,
-    max_folds=None,
-    max_objects=None,
-    cfg=None,
+    pivot_df, horizon, train_modes=("real_only", "real_plus_synth"), synth_days=30,
+    min_train_hours=None, step_hours=None, max_folds=None, max_objects=None, cfg=None,
 ):
     cfg = cfg or GATTrainConfig()
     pivot_df = pivot_df.sort_index()
-    object_ids = (
-        list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
-    )
+    object_ids = list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     pivot_df = pivot_df[object_ids]
-
-    adj_mask = build_adjacency_mask(pivot_df, cfg.top_k_neighbors, cfg.min_corr)
-    adj_np = adj_mask.squeeze().numpy()
 
     prepended_synth = None
     if "real_plus_synth" in train_modes:
@@ -787,10 +614,8 @@ def run_gat_backtest(
         print(f"GAT synthetic week: {prepended_synth.index[0]} → {prepended_synth.index[-1]}")
 
     folds = make_rolling_folds(len(pivot_df), horizon, min_train_hours, step_hours)
-    if max_folds is not None:
-        folds = folds[-max_folds:]
-    if not folds:
-        raise ValueError(f"Not enough folds for GAT horizon={horizon}.")
+    if max_folds is not None: folds = folds[-max_folds:]
+    if not folds: raise ValueError(f"Not enough folds for GAT horizon={horizon}.")
 
     rows, histories, synth_validation_rows = [], [], []
 
@@ -804,6 +629,9 @@ def run_gat_backtest(
             val.update({"fold": fold["fold"], "horizon": horizon})
             synth_validation_rows.append(val)
 
+        adj_mask = build_adjacency_mask(real_train_slice, cfg.top_k_neighbors, cfg.min_corr)
+        adj_np = adj_mask.squeeze(dim=0).squeeze(dim=0).numpy()
+
         active_objects = get_active_objects(real_train_slice, object_ids)
 
         for train_mode in train_modes:
@@ -811,77 +639,40 @@ def run_gat_backtest(
                 train_real = pd.concat([prepended_synth, real_train_slice]).sort_index()
                 fold_synth = None
                 if len(real_train_slice) < 72:
-                    dyn_days = get_synth_days(
-                        len(real_train_slice), base_synth_days=synth_days,
-                    )
+                    dyn_days = get_synth_days(len(real_train_slice), base_synth_days=synth_days)
                     fold_synth = synthesize_from_train(
-                        real_train_slice,
-                        gen_days=dyn_days,
-                        seed=cfg.seed + fold["fold"] + horizon * 1000,
+                        real_train_slice, gen_days=dyn_days, seed=cfg.seed + fold["fold"] + horizon * 1000,
                     )
             else:
                 train_real = real_train_slice
                 fold_synth = None
 
-            print(
-                f"GAT h={horizon} fold={fold['fold']} mode={train_mode} "
-                f"train={len(train_real)}h (real={len(real_train_slice)}h) "
-                f"test={len(test_real)}h active={len(active_objects)}/{len(object_ids)}"
-            )
-
             if train_mode == "real_plus_synth":
                 model, scales, history = train_gat_two_phase(
-                    train_real, fold_synth, horizon, cfg, adj_mask,
-                    scale_source=real_train_slice,
+                    train_real, fold_synth, horizon, cfg, adj_mask, scale_source=real_train_slice
                 )
             else:
                 model, scales, history = train_gat(
-                    real_train_slice, None, horizon, cfg, adj_mask,
+                    real_train_slice, None, horizon, cfg, adj_mask, scale_source=real_train_slice
                 )
 
             if fold["fold"] == folds[-1]["fold"]:
-                model_path = (
-                    config.OUTPUT_DIR / f"gat_model_rolling_{train_mode}_h{horizon}.pt"
-                )
+                model_path = config.OUTPUT_DIR / f"gat_model_rolling_{train_mode}_h{horizon}.pt"
                 save_gat_checkpoint(model, scales, cfg, adj_np, model_path)
 
             for item in history:
-                histories.append({
-                    **item,
-                    "horizon": horizon,
-                    "fold": fold["fold"],
-                    "train_mode": train_mode,
-                    "model": "GAT",
-                })
+                histories.append({**item, "horizon": horizon, "fold": fold["fold"], "train_mode": train_mode, "model": "GAT"})
 
-            pred_df = predict_gat_batch(
-                model, real_train_slice, target_index, scales, cfg, adj_mask,
-            )
+            pred_df = predict_gat_batch(model, real_train_slice, target_index, scales, cfg, adj_mask)
             day_mask = get_day_mask(target_index)
 
             for oid in active_objects:
                 yt = test_real[oid].values[day_mask]
                 yp = pred_df[oid].values[day_mask]
-                if len(yt) == 0:
-                    continue
-                row = forecast_metrics(
-                    yt, yp,
-                    model_name="GAT",
-                    horizon=horizon,
-                    train_mode=train_mode,
-                    object_id=oid,
-                    fold=fold["fold"],
-                )
-                row.update({
-                    "test_start": target_index[0],
-                    "test_end": target_index[-1],
-                    "train_hours": len(real_train_slice),
-                    "test_data": "real",
-                })
+                if len(yt) == 0: continue
+                row = forecast_metrics(yt, yp, model_name="GAT", horizon=horizon, train_mode=train_mode, object_id=oid, fold=fold["fold"])
+                row.update({"test_start": target_index[0], "test_end": target_index[-1], "train_hours": len(real_train_slice), "test_data": "real"})
                 rows.append(row)
 
     results = pd.DataFrame(rows)
-    summary = summarize_results(results)
-    histories = pd.DataFrame(histories)
-    synth_validation = pd.DataFrame(synth_validation_rows)
-    return results, summary, histories, synth_validation
+    return results, summarize_results(results), pd.DataFrame(histories), pd.DataFrame(synth_validation_rows)
