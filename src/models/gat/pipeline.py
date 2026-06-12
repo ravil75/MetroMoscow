@@ -189,29 +189,39 @@ class GATWindowDataset(Dataset):
 
 # ── Temporal Encoder ─────────────────────────────────────────────────────────
 
+# ── Temporal Encoder (КАУЗАЛЬНЫЙ) ────────────────────────────────────────────
+
 class TemporalEncoder(nn.Module):
+    """Dilated Causal Conv1d стек. Возвращает скрытое состояние 
+    последнего временного шага (каузальный подход, аналогично LSTM)."""
     def __init__(self, in_features, d_model, dropout=0.1):
         super().__init__()
         dilations = [1, 2, 4, 8, 16]
+        
         self.input_proj = nn.Conv1d(in_features, d_model, 1)
+        
+        # Causal Conv1d: padding = dilation * (kernel_size - 1)
         self.convs = nn.ModuleList([
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=d, dilation=d) for d in dilations
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=d * 2, dilation=d) 
+            for d in dilations
         ])
         self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
         self.drop = nn.Dropout(dropout)
-        self.pool_w = nn.Linear(d_model, 1)
 
     def forward(self, x):
-        h = self.input_proj(x)
+        h = self.input_proj(x)            # [B*N, d, T]
+        
         for conv, norm in zip(self.convs, self.norms):
             residual = h
             h = conv(h)
+            # Обрезаем будущее (оставляем только T шагов с конца)
+            h = h[:, :, -x.shape[2]:]      
             h = F.gelu(norm(h.transpose(1, 2)).transpose(1, 2))
             h = self.drop(h)
             h = h + residual
-        h = h.transpose(1, 2)
-        w = torch.softmax(self.pool_w(h), dim=1)
-        return (w * h).sum(dim=1)
+            
+        # Берем вектор ПОСЛЕДНЕГО часа (аналог hidden state в LSTM)
+        return h[:, :, -1]                # [B*N, d_model]
 
 
 # ── GAT Layer (Пункт 8: масштабирование внимания) ──────────────────────────────
