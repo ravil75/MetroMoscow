@@ -170,6 +170,9 @@ def save_gat_checkpoint(model, scales, cfg, graph, filepath):
         "horizon": model.horizon,
         "past_window": model.past_window,
         "n_neighbors": model.n_neighbors,
+        "n_nodes": model.n_nodes,
+        "use_adaptive": model.use_adaptive,
+        "adj_emb_dim": model.adj_emb_dim,
         "graph": graph,
     }
     torch.save(checkpoint, filepath)
@@ -191,6 +194,9 @@ def load_gat_checkpoint(filepath, device="auto"):
         horizon=checkpoint["horizon"],
         dropout=cfg.dropout,
         neighbor_dropout=cfg.neighbor_dropout,
+        n_nodes=checkpoint.get("n_nodes", 1),
+        use_adaptive=checkpoint.get("use_adaptive", False),
+        adj_emb_dim=checkpoint.get("adj_emb_dim", 16),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -219,6 +225,8 @@ class GATWindowDataset(Dataset):
         self.samples = []
         self.frames_np = []
         self.covariates_np = []
+        self.tod_np = []
+        self.dow_np = []
 
         self.scales_log = np.log1p(
             np.array([scales[oid] for oid in self.object_ids], dtype=np.float32)
@@ -231,6 +239,9 @@ class GATWindowDataset(Dataset):
             self.frames_np.append(frame[self.object_ids].values.astype(np.float32))
             cov = make_time_covariates(frame.index, is_synthetic=is_synthetic)
             self.covariates_np.append(cov.values.astype(np.float32))
+            idx = pd.DatetimeIndex(frame.index)
+            self.tod_np.append(idx.hour.values.astype(np.int64))
+            self.dow_np.append(idx.dayofweek.values.astype(np.int64))
 
         for fi, fnp in enumerate(self.frames_np):
             max_start = len(fnp) - past_window - horizon
@@ -247,6 +258,8 @@ class GATWindowDataset(Dataset):
         fi, ci, start = self.samples[idx]
         data = self.frames_np[fi]
         cov = self.covariates_np[fi]
+        tod = self.tod_np[fi]
+        dow = self.dow_np[fi]
 
         h_s, h_e = start, start + self.past_window
         t_s, t_e = h_e, h_e + self.horizon
@@ -296,6 +309,12 @@ class GATWindowDataset(Dataset):
             torch.from_numpy(decoder_x.astype(np.float32)),
             torch.from_numpy(y),
             torch.from_numpy(weight),
+            torch.tensor(ci, dtype=torch.long),
+            torch.from_numpy(np.ascontiguousarray(nidx).astype(np.int64)),
+            torch.from_numpy(tod[h_s:h_e].astype(np.int64)),
+            torch.from_numpy(dow[h_s:h_e].astype(np.int64)),
+            torch.from_numpy(tod[t_s:t_e].astype(np.int64)),
+            torch.from_numpy(dow[t_s:t_e].astype(np.int64)),
         )
 
 
@@ -388,7 +407,8 @@ class GATForecaster(nn.Module):
     def __init__(
         self, in_features=10, dec_features=10, stat_dim=29, d_model=128,
         n_heads=4, n_neighbors=8, past_window=72, horizon=24,
-        dropout=0.1, neighbor_dropout=0.15,
+        dropout=0.1, neighbor_dropout=0.15, n_nodes=1, use_adaptive=True,
+        adj_emb_dim=16,
     ):
         super().__init__()
         self.in_features = in_features
@@ -399,10 +419,26 @@ class GATForecaster(nn.Module):
         self.past_window = past_window
         self.n_neighbors = n_neighbors
         self.neighbor_dropout = neighbor_dropout
+        self.n_nodes = n_nodes
+        self.use_adaptive = use_adaptive
+        self.adj_emb_dim = adj_emb_dim
 
         self.encoder = TemporalEncoder(in_features, d_model, dropout)
         self.pos_emb = nn.Parameter(torch.zeros(1, past_window, d_model))
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+        # ── Adaptive embeddings (STAEformer, CIKM'23) + adaptive adjacency
+        #    (Graph WaveNet / AGCRN). Малая инициализация → стартуют около нуля
+        #    и включаются по мере обучения, не ломая базовую динамику.
+        if use_adaptive:
+            self.node_emb = nn.Embedding(n_nodes, d_model)   # идентичность узла
+            self.tod_emb = nn.Embedding(24, d_model)         # час суток
+            self.dow_emb = nn.Embedding(7, d_model)          # день недели
+            self.adj_src = nn.Embedding(n_nodes, adj_emb_dim)  # выученный граф:
+            self.adj_dst = nn.Embedding(n_nodes, adj_emb_dim)  # ребро = ⟨e_i, e_j⟩
+            for emb in (self.node_emb, self.tod_emb, self.dow_emb,
+                        self.adj_src, self.adj_dst):
+                nn.init.normal_(emb.weight, std=0.02)
 
         # FiLM-кондиционирование на статики узла; нулевая инициализация —
         # модуляция включается постепенно по мере обучения
@@ -428,22 +464,42 @@ class GATForecaster(nn.Module):
         self.out_grn = GRN(d_model, d_model, d_model, dropout)
         self.out_proj = nn.Linear(d_model, 1)
 
-    def forward(self, enc_x, neigh_x, edge_w, node_stat, dec_x):
+    def forward(self, enc_x, neigh_x, edge_w, node_stat, dec_x,
+                node_idx=None, neigh_idx=None, enc_tod=None, enc_dow=None,
+                dec_tod=None, dec_dow=None):
         B, K, T, Fin = neigh_x.shape
+        adaptive = self.use_adaptive and node_idx is not None
 
         h_self = self.encoder(enc_x) + self.pos_emb[:, :T]
         gamma, beta = self.stat_film(node_stat).chunk(2, dim=-1)
         h_self = h_self * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
 
         h_neigh = self.encoder(neigh_x.reshape(B * K, T, Fin)) + self.pos_emb[:, :T]
+        h_neigh = h_neigh.reshape(B, K, T, self.d_model)
+
+        if adaptive:
+            tod_e = self.tod_emb(enc_tod) + self.dow_emb(enc_dow)    # [B, T, d]
+            node_e = self.node_emb(node_idx)                         # [B, d]
+            h_self = h_self + node_e.unsqueeze(1) + tod_e
+            neigh_node_e = self.node_emb(neigh_idx)                  # [B, K, d]
+            h_neigh = h_neigh + neigh_node_e.unsqueeze(2) + tod_e.unsqueeze(1)
+
         h_neigh = h_neigh.reshape(B, K * T, self.d_model)
 
         h0 = torch.tanh(self.h0_proj(h_self[:, -1])).unsqueeze(0).contiguous()
-        dec_h, _ = self.dec_gru(self.dec_embed(dec_x), h0)           # [B, H, d]
+        dec_in = self.dec_embed(dec_x)
+        if adaptive:
+            dec_te = self.tod_emb(dec_tod) + self.dow_emb(dec_dow)   # [B, H, d]
+            dec_in = dec_in + node_e.unsqueeze(1) + dec_te
+        dec_h, _ = self.dec_gru(dec_in, h0)                          # [B, H, d]
 
         x = self.norm1(dec_h + self.drop(self.temporal_attn(dec_h, h_self)))
 
         bias = self.edge_scale * edge_w                              # [B, K]
+        if adaptive:
+            a_src = self.adj_src(node_idx)                           # [B, da]
+            a_dst = self.adj_dst(neigh_idx)                          # [B, K, da]
+            bias = bias + (a_src.unsqueeze(1) * a_dst).sum(-1) / math.sqrt(self.adj_emb_dim)
         if self.training and self.neighbor_dropout > 0 and K > 1:
             # Neighbor dropout: слот 0 (сильнейший сосед) не глушится — softmax
             # всегда имеет хотя бы один живой ключ. -1e4 безопасно под fp16.
@@ -473,6 +529,8 @@ class GATTrainConfig:
     dropout: float = 0.1
     neighbor_dropout: float = 0.15
     night_weight: float = 0.3
+    use_adaptive: bool = True
+    adj_emb_dim: int = 16
     epochs: int = 12
     batch_size: int = 256
     learning_rate: float = 1e-3
@@ -532,6 +590,9 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
         horizon=horizon,
         dropout=cfg.dropout,
         neighbor_dropout=cfg.neighbor_dropout,
+        n_nodes=len(object_ids),
+        use_adaptive=cfg.use_adaptive,
+        adj_emb_dim=cfg.adj_emb_dim,
     ).to(device)
 
     if pretrained_model is not None:
@@ -556,7 +617,9 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
     history = []
     for epoch in range(1, cfg.epochs + 1):
         total_loss, n_seen = 0.0, 0
-        for enc_x, neigh_x, edge_w, node_stat, dec_x, y, w in loader:
+        for batch in loader:
+            (enc_x, neigh_x, edge_w, node_stat, dec_x, y, w,
+             node_idx, neigh_idx, enc_tod, enc_dow, dec_tod, dec_dow) = batch
             enc_x = enc_x.to(device=device, dtype=torch.float32, non_blocking=True)
             neigh_x = neigh_x.to(device=device, dtype=torch.float32, non_blocking=True)
             edge_w = edge_w.to(device=device, dtype=torch.float32, non_blocking=True)
@@ -564,10 +627,17 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
             dec_x = dec_x.to(device=device, dtype=torch.float32, non_blocking=True)
             y = y.to(device=device, dtype=torch.float32, non_blocking=True)
             w = w.to(device=device, dtype=torch.float32, non_blocking=True)
+            node_idx = node_idx.to(device=device, non_blocking=True)
+            neigh_idx = neigh_idx.to(device=device, non_blocking=True)
+            enc_tod = enc_tod.to(device=device, non_blocking=True)
+            enc_dow = enc_dow.to(device=device, non_blocking=True)
+            dec_tod = dec_tod.to(device=device, non_blocking=True)
+            dec_dow = dec_dow.to(device=device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=cfg.amp and device.type == "cuda"):
-                pred = model(enc_x, neigh_x, edge_w, node_stat, dec_x)
+                pred = model(enc_x, neigh_x, edge_w, node_stat, dec_x,
+                             node_idx, neigh_idx, enc_tod, enc_dow, dec_tod, dec_dow)
                 loss = (loss_fn(pred, y) * w).sum() / w.sum().clamp_min(1.0)
 
             scaler.scale(loss).backward()
@@ -667,14 +737,28 @@ def predict_gat_batch(model, history_frame, target_index, scales, cfg, graph, ba
     dec_cov_b = np.broadcast_to(dec_cov[None], (n_objects,) + dec_cov.shape)
     decoder_x = np.concatenate([seasonal[:, :, None], dec_cov_b], axis=2).astype(np.float32)
 
+    node_idx_all = np.arange(n_objects, dtype=np.int64)
+    enc_tod = pd.DatetimeIndex(hist_index).hour.values.astype(np.int64)
+    enc_dow = pd.DatetimeIndex(hist_index).dayofweek.values.astype(np.int64)
+    dec_tod = pd.DatetimeIndex(target_index).hour.values.astype(np.int64)
+    dec_dow = pd.DatetimeIndex(target_index).dayofweek.values.astype(np.int64)
+
     preds = []
     with torch.no_grad():
         for start in range(0, n_objects, batch_size):
             stop = start + batch_size
+            b = min(stop, n_objects) - start
             to_dev = lambda a: torch.from_numpy(a[start:stop]).to(device=device, dtype=torch.float32)
+            to_long = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=device)
+            enc_tod_b = to_long(np.broadcast_to(enc_tod[None], (b, enc_tod.shape[0])))
+            enc_dow_b = to_long(np.broadcast_to(enc_dow[None], (b, enc_dow.shape[0])))
+            dec_tod_b = to_long(np.broadcast_to(dec_tod[None], (b, dec_tod.shape[0])))
+            dec_dow_b = to_long(np.broadcast_to(dec_dow[None], (b, dec_dow.shape[0])))
             pred_scaled = model(
                 to_dev(encoder_x), to_dev(neigh_x), to_dev(edge_w),
                 to_dev(node_stats), to_dev(decoder_x),
+                to_long(node_idx_all[start:stop]), to_long(neigh_idx[start:stop]),
+                enc_tod_b, enc_dow_b, dec_tod_b, dec_dow_b,
             ).cpu().numpy()
 
             pred = np.expm1(np.clip(pred_scaled, 0.0, 4.0) * scale_logs[start:stop, None])
@@ -761,6 +845,11 @@ def run_gat_fast_experiment(
                     rows.append(row)
 
     results = pd.DataFrame(rows)
+    if results.empty:
+        print("⚠ GAT: пустой результат — все окна оценки попали на ночные часы "
+              "(день-маска 6:00–23:00). Для h=1 используй шаг, не кратный 24.")
+        cols = ["horizon", "train_mode", "model", "MAE", "RMSE", "MAPE", "SMAPE", "WAPE", "n_objects", "n_rows"]
+        return results, pd.DataFrame(columns=cols), pd.DataFrame(histories), pd.DataFrame(synth_validation_rows)
     return results, summarize_results(results), pd.DataFrame(histories), pd.DataFrame(synth_validation_rows)
 
 
@@ -842,4 +931,9 @@ def run_gat_backtest(
                 rows.append(row)
 
     results = pd.DataFrame(rows)
+    if results.empty:
+        print("⚠ GAT: пустой результат — все окна оценки попали на ночные часы "
+              "(день-маска 6:00–23:00). Для h=1 используй шаг, не кратный 24.")
+        cols = ["horizon", "train_mode", "model", "MAE", "RMSE", "MAPE", "SMAPE", "WAPE", "n_objects", "n_rows"]
+        return results, pd.DataFrame(columns=cols), pd.DataFrame(histories), pd.DataFrame(synth_validation_rows)
     return results, summarize_results(results), pd.DataFrame(histories), pd.DataFrame(synth_validation_rows)

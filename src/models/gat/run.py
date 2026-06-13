@@ -66,6 +66,11 @@ def parse_args():
         "--night-weight", type=float, default=0.3,
         help="Вес ночных часов (0-5) в лоссе; метрики считаются по дневным.",
     )
+    parser.add_argument(
+        "--no-adaptive", action="store_true",
+        help="Отключить adaptive embeddings (STAEformer) и adaptive adjacency "
+             "(Graph WaveNet/AGCRN) — вернуться к baseline-EgoGAT для A/B.",
+    )
 
     # Обучение
     parser.add_argument("--epochs", type=int, default=12)
@@ -109,6 +114,7 @@ def main():
         dropout=args.dropout,
         neighbor_dropout=args.neighbor_dropout,
         night_weight=args.night_weight,
+        use_adaptive=not args.no_adaptive,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,

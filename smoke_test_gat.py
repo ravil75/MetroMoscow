@@ -34,19 +34,27 @@ print("build_graph OK:", graph["neigh_idx"].shape, "node_stats:", graph["node_st
 hit = sum(2 * i in graph["neigh_idx"][2 * i + 1] for i in range(N // 2))
 print(f"лидер найден среди соседей фолловера: {hit}/{N//2}")
 
-# 2. Dataset
+# 2. Dataset (новый тапл: + node_idx, neigh_idx, tod/dow для enc и dec)
 scales = compute_object_scales(pivot.iloc[:120])
 ds = GATWindowDataset([pivot.iloc[:120]], list(pivot.columns), scales, graph, 72, 24)
-enc_x, neigh_x, edge_w, node_stat, dec_x, y, w = ds[0]
+enc_x, neigh_x, edge_w, node_stat, dec_x, y, w, node_idx, neigh_idx, e_tod, e_dow, d_tod, d_dow = ds[0]
 assert enc_x.shape == (72, 10) and neigh_x.shape == (4, 72, 10)
 assert dec_x.shape == (24, 10) and y.shape == (24,) and w.shape == (24,)
-print(f"dataset OK: {len(ds)} сэмплов; веса ночных часов: {w.min():.2f}, дневных: {w.max():.2f}")
+assert neigh_idx.shape == (4,) and e_tod.shape == (72,) and d_tod.shape == (24,)
+assert int(d_tod.max()) <= 23 and int(d_dow.max()) <= 6
+print(f"dataset OK: {len(ds)} сэмплов; node_idx={int(node_idx)}, соседи={neigh_idx.tolist()}")
 
-# 3. Модель: forward + train (CPU, 2 эпохи)
+# 3. Модель: forward + train (CPU, 2 эпохи) — adaptive embeddings + adaptive adjacency
 cfg = GATTrainConfig(epochs=2, batch_size=64, top_k_neighbors=4, device="cpu", amp=False, num_workers=0)
 model, scales, history = train_gat(pivot.iloc[:120], None, 24, cfg, graph)
 assert len(history) == 2 and np.isfinite(history[-1]["loss"])
-print("train OK, loss:", [round(h["loss"], 4) for h in history])
+print("train OK (adaptive), loss:", [round(h["loss"], 4) for h in history])
+
+# 3b. Baseline-режим (--no-adaptive) тоже должен работать
+cfg_base = GATTrainConfig(epochs=1, batch_size=64, top_k_neighbors=4, device="cpu", amp=False, num_workers=0, use_adaptive=False)
+model_base, _, hist_base = train_gat(pivot.iloc[:120], None, 24, cfg_base, graph)
+assert np.isfinite(hist_base[-1]["loss"])
+print("train OK (baseline, no-adaptive), loss:", round(hist_base[-1]["loss"], 4))
 
 # 4. Инференс: оба горизонта
 target_24 = pd.date_range(pivot.index[120], periods=24, freq="h")
