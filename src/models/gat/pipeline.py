@@ -571,10 +571,15 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
     train_dataset = usable[0] if len(usable) == 1 else torch.utils.data.ConcatDataset(usable)
     effective_bs = max(1, min(cfg.batch_size, len(train_dataset)))
 
-    loader = DataLoader(
-        train_dataset, batch_size=effective_bs, shuffle=True,
+    loader_kwargs = dict(
+        batch_size=effective_bs, shuffle=True,
         num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available(), drop_last=False,
     )
+    if cfg.num_workers > 0:
+        # persistent_workers + prefetch: воркеры не пересоздаются каждую эпоху,
+        # загрузка данных перекрывается с GPU-вычислениями
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
+    loader = DataLoader(train_dataset, **loader_kwargs)
 
     sample = usable[0][0]
     device = resolve_device(cfg.device)
