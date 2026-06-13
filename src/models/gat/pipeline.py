@@ -119,11 +119,11 @@ def compute_node_stats(train_slice):
     return np.clip((feats - mean) / std, -5.0, 5.0).astype(np.float32)
 
 
-def build_graph(train_slice, top_k=8, min_corr=0.05):
-    """Возвращает ego-граф: top-k соседей по residual-корреляции на объект.
+def build_graph(train_slice, top_k=8, min_corr=0.05, max_lag=3):
+    """Возвращает ego-граф: top-k соседей на объект по lead-lag-корреляции остатков.
 
     neigh_idx  : [N, K] int64  — индексы соседей; слоты без соседа = свой индекс
-    neigh_w    : [N, K] float32 — residual-корреляция ребра (0 для пустых слотов)
+    neigh_w    : [N, K] float32 — вес ребра (0 для пустых слотов)
     node_stats : [N, S] float32 — статические признаки узлов
     """
     values = train_slice.values.astype(np.float64)
@@ -136,13 +136,23 @@ def build_graph(train_slice, top_k=8, min_corr=0.05):
     std = resid.std(axis=0, keepdims=True)
     std[std < 1e-8] = 1.0
     rn = resid / std
-    corr = (rn.T @ rn) / rn.shape[0]
-    np.fill_diagonal(corr, -2.0)
+    n_hours = rn.shape[0]
+
+    # Lead-lag-aware скоринг: ребро = max кросс-корреляции остатков по лагам 0..max_lag.
+    # score[i,j] на лаге l = corr(resid_i[t], resid_j[t-l]) — сосед j, ОПЕРЕЖАЮЩИЙ цель i,
+    # получает высокий вес. Именно этот сигнал (всплеск источника час назад) и отличает
+    # граф от TFT; он особенно важен на горизонте 1 час, где раньше была ничья.
+    score = (rn.T @ rn) / n_hours
+    for lag in range(1, max_lag + 1):
+        if lag >= n_hours:
+            break
+        score = np.maximum(score, (rn[lag:].T @ rn[:n_hours - lag]) / (n_hours - lag))
+    np.fill_diagonal(score, -2.0)
 
     top_k = min(top_k, max(n_objects - 1, 1))
-    order = np.argsort(-corr, axis=1)[:, :top_k]
+    order = np.argsort(-score, axis=1)[:, :top_k]
     rows = np.arange(n_objects)[:, None]
-    weights = corr[rows, order].astype(np.float32)
+    weights = score[rows, order].astype(np.float32)
     invalid = weights < min_corr
     neigh_idx = np.where(invalid, rows, order).astype(np.int64)
     neigh_w = np.where(invalid, 0.0, weights).astype(np.float32)
@@ -323,12 +333,19 @@ class GRN(nn.Module):
 
 
 class TemporalEncoder(nn.Module):
-    """Каузальный dilated Conv1d стек (RF=63). Возвращает ВСЕ T состояний —
-    временная ось сохраняется до декодера, никакого сжатия в один вектор."""
+    """Каузальный dilated Conv1d стек. Дилатации подбираются так, чтобы
+    рецептивное поле покрыло весь past_window (для 168ч — всю недельную
+    сезонность). Возвращает ВСЕ T состояний — временная ось сохраняется
+    до декодера, никакого сжатия в один вектор."""
 
-    def __init__(self, in_features, d_model, dropout=0.1):
+    def __init__(self, in_features, d_model, past_window=72, dropout=0.1):
         super().__init__()
-        self.dilations = [1, 2, 4, 8, 16]
+        dilations, d, rf = [], 1, 1
+        while rf < past_window and d <= past_window:
+            dilations.append(d)
+            rf += 2 * d                       # RF каузального стека (kernel=3)
+            d *= 2
+        self.dilations = dilations or [1]
         self.input_proj = nn.Conv1d(in_features, d_model, 1)
         self.convs = nn.ModuleList([
             nn.Conv1d(d_model, d_model, kernel_size=3, dilation=d, padding=0)
@@ -400,7 +417,7 @@ class GATForecaster(nn.Module):
         self.n_neighbors = n_neighbors
         self.neighbor_dropout = neighbor_dropout
 
-        self.encoder = TemporalEncoder(in_features, d_model, dropout)
+        self.encoder = TemporalEncoder(in_features, d_model, past_window=past_window, dropout=dropout)
         self.pos_emb = nn.Parameter(torch.zeros(1, past_window, d_model))
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
 
@@ -420,9 +437,10 @@ class GATForecaster(nn.Module):
         self.spatial_attn = CrossAttention(d_model, n_heads, dropout)
         self.norm2 = nn.LayerNorm(d_model)
         self.edge_scale = nn.Parameter(torch.tensor(1.0))
-        # Гейт стартует прикрытым (sigmoid(-2)≈0.12): сначала темпоральный путь
+        # Гейт стартует приоткрытым (sigmoid(-1)≈0.27): lead-lag граф достаточно
+        # надёжен, чтобы пускать пространственный путь раньше, но не доминантно
         self.spatial_gate = nn.Linear(2 * d_model, 1)
-        nn.init.constant_(self.spatial_gate.bias, -2.0)
+        nn.init.constant_(self.spatial_gate.bias, -1.0)
 
         self.drop = nn.Dropout(dropout)
         self.out_grn = GRN(d_model, d_model, d_model, dropout)
@@ -470,6 +488,7 @@ class GATTrainConfig:
     n_heads: int = 4
     top_k_neighbors: int = 8
     min_corr: float = 0.05
+    max_lag: int = 3
     dropout: float = 0.1
     neighbor_dropout: float = 0.15
     night_weight: float = 0.3
@@ -709,7 +728,7 @@ def run_gat_fast_experiment(
     pivot_df = pivot_df[object_ids]
 
     train_real = pivot_df.iloc[:train_hours]
-    graph = build_graph(train_real, cfg.top_k_neighbors, cfg.min_corr)
+    graph = build_graph(train_real, cfg.top_k_neighbors, cfg.min_corr, cfg.max_lag)
 
     rows, histories, synth_validation_rows = [], [], []
     synthetic_train = None
@@ -797,7 +816,7 @@ def run_gat_backtest(
             val.update({"fold": fold["fold"], "horizon": horizon})
             synth_validation_rows.append(val)
 
-        graph = build_graph(real_train_slice, cfg.top_k_neighbors, cfg.min_corr)
+        graph = build_graph(real_train_slice, cfg.top_k_neighbors, cfg.min_corr, cfg.max_lag)
         active_objects = get_active_objects(real_train_slice, object_ids)
 
         for train_mode in train_modes:

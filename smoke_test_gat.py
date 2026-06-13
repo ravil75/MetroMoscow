@@ -25,14 +25,15 @@ for i in range(N // 2):
     cols[f"obj_{2*i+1:03d}"] = np.maximum(follow, 0)
 pivot = pd.DataFrame(cols, index=index)
 
-# 1. Граф
-graph = build_graph(pivot.iloc[:120], top_k=4, min_corr=0.05)
+# 1. Граф (lead-lag: follower = roll(lead, 1), т.е. lead опережает на 1 час)
+graph = build_graph(pivot.iloc[:120], top_k=4, min_corr=0.05, max_lag=3)
 assert graph["neigh_idx"].shape == (N, 4)
 assert graph["node_stats"].shape[0] == N
 print("build_graph OK:", graph["neigh_idx"].shape, "node_stats:", graph["node_stats"].shape)
-# Лидер должен быть среди соседей фолловера
+# Лидер должен быть среди соседей фолловера — lead-lag отбор обязан его находить
 hit = sum(2 * i in graph["neigh_idx"][2 * i + 1] for i in range(N // 2))
 print(f"лидер найден среди соседей фолловера: {hit}/{N//2}")
+assert hit >= N // 2 - 2, f"lead-lag граф плохо находит опережающего соседа: {hit}/{N//2}"
 
 # 2. Dataset
 scales = compute_object_scales(pivot.iloc[:120])

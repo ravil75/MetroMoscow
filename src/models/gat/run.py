@@ -57,6 +57,10 @@ def parse_args():
         "--min-corr", type=float, default=0.05,
         help="Порог residual-корреляции для рёбер ego-графа.",
     )
+    parser.add_argument(
+        "--max-lag", type=int, default=3,
+        help="Макс. лаг (часов) для lead-lag отбора соседей; 0 = только одновременная корреляция.",
+    )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument(
         "--neighbor-dropout", type=float, default=0.15,
@@ -106,6 +110,7 @@ def main():
         n_heads=args.n_heads,
         top_k_neighbors=args.top_k_neighbors,
         min_corr=args.min_corr,
+        max_lag=args.max_lag,
         dropout=args.dropout,
         neighbor_dropout=args.neighbor_dropout,
         night_weight=args.night_weight,
