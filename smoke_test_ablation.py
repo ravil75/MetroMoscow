@@ -35,10 +35,8 @@ for name, emb, adj in combos:
     # наличие параметров строго по флагам
     has_node = hasattr(model, "node_emb")
     has_adj = hasattr(model, "adj_src")
-    has_norm = hasattr(model, "embed_norm")
     assert has_node == emb, f"{name}: node_emb={has_node}, ожидалось {emb}"
     assert has_adj == adj, f"{name}: adj_src={has_adj}, ожидалось {adj}"
-    assert has_norm == emb, f"{name}: embed_norm={has_norm}, ожидалось {emb}"
     pred = predict_gat_batch(model, pivot.iloc[:120], target, sc, cfg, graph)
     ok = np.isfinite(pred.values).all() and (pred.values >= 0).all()
     assert ok and pred.shape == (24, N), f"{name}: некорректный прогноз"

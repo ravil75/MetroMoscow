@@ -451,19 +451,20 @@ class GATForecaster(nn.Module):
             self.node_emb = nn.Embedding(n_nodes, d_model)   # идентичность узла
             self.tod_emb = nn.Embedding(24, d_model)         # час суток
             self.dow_emb = nn.Embedding(7, d_model)          # день недели
-            for emb in (self.node_emb, self.tod_emb, self.dow_emb):
-                nn.init.normal_(emb.weight, std=0.02)
-            # LayerNorm после прибавления эмбеддингов: ограничивает их величину,
-            # иначе большая таблица node_emb (n_nodes×d) может раздуть активации
-            # и разнести 24-шаговый декодер (наблюдали дивергенцию фолда на h=24).
-            self.embed_norm = nn.LayerNorm(d_model)
-            self.embed_norm_dec = nn.LayerNorm(d_model)
         #   Идея 2 — Graph WaveNet / AGCRN: adaptive adjacency (ребро = ⟨e_i, e_j⟩).
         if use_adaptive_adj:
             self.adj_src = nn.Embedding(n_nodes, adj_emb_dim)
             self.adj_dst = nn.Embedding(n_nodes, adj_emb_dim)
-            for emb in (self.adj_src, self.adj_dst):
-                nn.init.normal_(emb.weight, std=0.02)
+        # Инициализация одним списком в фиксированном порядке: при обеих включённых
+        # идеях последовательность RNG совпадает с исходной реализацией → D
+        # воспроизводится бит-в-бит (без сдвига сида от раздельных блоков).
+        _emb_init = []
+        if use_adaptive_embed:
+            _emb_init += [self.node_emb, self.tod_emb, self.dow_emb]
+        if use_adaptive_adj:
+            _emb_init += [self.adj_src, self.adj_dst]
+        for emb in _emb_init:
+            nn.init.normal_(emb.weight, std=0.02)
 
         # FiLM-кондиционирование на статики узла; нулевая инициализация —
         # модуляция включается постепенно по мере обучения
@@ -506,9 +507,9 @@ class GATForecaster(nn.Module):
         if embed:
             tod_e = self.tod_emb(enc_tod) + self.dow_emb(enc_dow)    # [B, T, d]
             node_e = self.node_emb(node_idx)                         # [B, d]
-            h_self = self.embed_norm(h_self + node_e.unsqueeze(1) + tod_e)
+            h_self = h_self + node_e.unsqueeze(1) + tod_e
             neigh_node_e = self.node_emb(neigh_idx)                  # [B, K, d]
-            h_neigh = self.embed_norm(h_neigh + neigh_node_e.unsqueeze(2) + tod_e.unsqueeze(1))
+            h_neigh = h_neigh + neigh_node_e.unsqueeze(2) + tod_e.unsqueeze(1)
 
         h_neigh = h_neigh.reshape(B, K * T, self.d_model)
 
@@ -516,7 +517,7 @@ class GATForecaster(nn.Module):
         dec_in = self.dec_embed(dec_x)
         if embed:
             dec_te = self.tod_emb(dec_tod) + self.dow_emb(dec_dow)   # [B, H, d]
-            dec_in = self.embed_norm_dec(dec_in + node_e.unsqueeze(1) + dec_te)
+            dec_in = dec_in + node_e.unsqueeze(1) + dec_te
         dec_h, _ = self.dec_gru(dec_in, h0)                          # [B, H, d]
 
         x = self.norm1(dec_h + self.drop(self.temporal_attn(dec_h, h_self)))
