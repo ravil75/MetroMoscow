@@ -68,8 +68,28 @@ def parse_args():
     )
     parser.add_argument(
         "--no-adaptive", action="store_true",
-        help="Отключить adaptive embeddings (STAEformer) и adaptive adjacency "
-             "(Graph WaveNet/AGCRN) — вернуться к baseline-EgoGAT для A/B.",
+        help="Отключить ОБЕ идеи из статей — вернуться к baseline-EgoGAT для A/B.",
+    )
+    parser.add_argument(
+        "--no-adaptive-embed", action="store_true",
+        help="Отключить только идею 1 — adaptive embeddings (STAEformer, CIKM'23).",
+    )
+    parser.add_argument(
+        "--no-adaptive-adj", action="store_true",
+        help="Отключить только идею 2 — adaptive adjacency (Graph WaveNet/AGCRN).",
+    )
+    parser.add_argument(
+        "--bidirectional-encoder", action="store_true",
+        help="Двунаправленный энкодер истории (как в STD-MAE). Сильнее каузального "
+             "при masked-предобучении; история полностью наблюдаема — leak'а нет.",
+    )
+    parser.add_argument(
+        "--pretrain-epochs", type=int, default=0,
+        help="Эпохи masked-предобучения энкодера (STD-MAE'24 / GPT-ST'23). 0 = выкл.",
+    )
+    parser.add_argument(
+        "--pretrain-mask-ratio", type=float, default=0.4,
+        help="Доля маскируемых временных шагов при предобучении.",
     )
 
     # Обучение
@@ -114,7 +134,11 @@ def main():
         dropout=args.dropout,
         neighbor_dropout=args.neighbor_dropout,
         night_weight=args.night_weight,
-        use_adaptive=not args.no_adaptive,
+        use_adaptive_embed=not (args.no_adaptive or args.no_adaptive_embed),
+        use_adaptive_adj=not (args.no_adaptive or args.no_adaptive_adj),
+        bidirectional_encoder=args.bidirectional_encoder,
+        pretrain_epochs=args.pretrain_epochs,
+        pretrain_mask_ratio=args.pretrain_mask_ratio,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,

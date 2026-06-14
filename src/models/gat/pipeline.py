@@ -171,8 +171,10 @@ def save_gat_checkpoint(model, scales, cfg, graph, filepath):
         "past_window": model.past_window,
         "n_neighbors": model.n_neighbors,
         "n_nodes": model.n_nodes,
-        "use_adaptive": model.use_adaptive,
+        "use_adaptive_embed": model.use_adaptive_embed,
+        "use_adaptive_adj": model.use_adaptive_adj,
         "adj_emb_dim": model.adj_emb_dim,
+        "bidirectional_encoder": model.bidirectional_encoder,
         "graph": graph,
     }
     torch.save(checkpoint, filepath)
@@ -182,7 +184,12 @@ def save_gat_checkpoint(model, scales, cfg, graph, filepath):
 def load_gat_checkpoint(filepath, device="auto"):
     device = resolve_device(device)
     checkpoint = torch.load(filepath, map_location=device, weights_only=False)
-    cfg = GATTrainConfig(**checkpoint["cfg"])
+    cfg_dict = dict(checkpoint["cfg"])
+    if "use_adaptive" in cfg_dict:                 # backward-compat: единый флаг → оба
+        legacy = cfg_dict.pop("use_adaptive")
+        cfg_dict.setdefault("use_adaptive_embed", legacy)
+        cfg_dict.setdefault("use_adaptive_adj", legacy)
+    cfg = GATTrainConfig(**cfg_dict)
     model = GATForecaster(
         in_features=checkpoint["in_features"],
         dec_features=checkpoint["dec_features"],
@@ -195,8 +202,10 @@ def load_gat_checkpoint(filepath, device="auto"):
         dropout=cfg.dropout,
         neighbor_dropout=cfg.neighbor_dropout,
         n_nodes=checkpoint.get("n_nodes", 1),
-        use_adaptive=checkpoint.get("use_adaptive", False),
+        use_adaptive_embed=checkpoint.get("use_adaptive_embed", checkpoint.get("use_adaptive", False)),
+        use_adaptive_adj=checkpoint.get("use_adaptive_adj", checkpoint.get("use_adaptive", False)),
         adj_emb_dim=checkpoint.get("adj_emb_dim", 16),
+        bidirectional_encoder=checkpoint.get("bidirectional_encoder", False),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -342,12 +351,16 @@ class GRN(nn.Module):
 
 
 class TemporalEncoder(nn.Module):
-    """Каузальный dilated Conv1d стек (RF=63). Возвращает ВСЕ T состояний —
-    временная ось сохраняется до декодера, никакого сжатия в один вектор."""
+    """Dilated Conv1d стек (RF=63). Возвращает ВСЕ T состояний — временная ось
+    сохраняется до декодера, никакого сжатия в один вектор. При causal=False
+    дополнение симметричное → двунаправленный энкодер (каждый шаг видит контекст
+    с обеих сторон). История полностью наблюдаема, поэтому это корректно и для
+    прогноза, и для masked-предобучения в стиле STD-MAE."""
 
-    def __init__(self, in_features, d_model, dropout=0.1):
+    def __init__(self, in_features, d_model, dropout=0.1, causal=True):
         super().__init__()
         self.dilations = [1, 2, 4, 8, 16]
+        self.causal = causal
         self.input_proj = nn.Conv1d(in_features, d_model, 1)
         self.convs = nn.ModuleList([
             nn.Conv1d(d_model, d_model, kernel_size=3, dilation=d, padding=0)
@@ -360,7 +373,8 @@ class TemporalEncoder(nn.Module):
         h = self.input_proj(x.transpose(1, 2))      # [B, d, T]
         for conv, norm, dil in zip(self.convs, self.norms, self.dilations):
             residual = h
-            h = conv(F.pad(h, (2 * dil, 0)))        # левое (каузальное) дополнение
+            pad = (2 * dil, 0) if self.causal else (dil, dil)   # каузально / двунаправленно
+            h = conv(F.pad(h, pad))
             h = F.gelu(norm(h.transpose(1, 2)).transpose(1, 2))
             h = self.drop(h) + residual
         return h.transpose(1, 2)                    # [B, T, d]
@@ -407,8 +421,9 @@ class GATForecaster(nn.Module):
     def __init__(
         self, in_features=10, dec_features=10, stat_dim=29, d_model=128,
         n_heads=4, n_neighbors=8, past_window=72, horizon=24,
-        dropout=0.1, neighbor_dropout=0.15, n_nodes=1, use_adaptive=True,
-        adj_emb_dim=16,
+        dropout=0.1, neighbor_dropout=0.15, n_nodes=1,
+        use_adaptive_embed=True, use_adaptive_adj=True, adj_emb_dim=16,
+        bidirectional_encoder=False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -420,24 +435,29 @@ class GATForecaster(nn.Module):
         self.n_neighbors = n_neighbors
         self.neighbor_dropout = neighbor_dropout
         self.n_nodes = n_nodes
-        self.use_adaptive = use_adaptive
+        self.use_adaptive_embed = use_adaptive_embed
+        self.use_adaptive_adj = use_adaptive_adj
         self.adj_emb_dim = adj_emb_dim
+        self.bidirectional_encoder = bidirectional_encoder
 
-        self.encoder = TemporalEncoder(in_features, d_model, dropout)
+        self.encoder = TemporalEncoder(in_features, d_model, dropout, causal=not bidirectional_encoder)
         self.pos_emb = nn.Parameter(torch.zeros(1, past_window, d_model))
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
 
-        # ── Adaptive embeddings (STAEformer, CIKM'23) + adaptive adjacency
-        #    (Graph WaveNet / AGCRN). Малая инициализация → стартуют около нуля
-        #    и включаются по мере обучения, не ломая базовую динамику.
-        if use_adaptive:
+        # Малая инициализация → эмбеддинги стартуют около нуля и включаются по
+        # мере обучения, не ломая базовую динамику. Две идеи независимы:
+        #   Идея 1 — STAEformer (CIKM'23): adaptive embeddings (узел + час + день).
+        if use_adaptive_embed:
             self.node_emb = nn.Embedding(n_nodes, d_model)   # идентичность узла
             self.tod_emb = nn.Embedding(24, d_model)         # час суток
             self.dow_emb = nn.Embedding(7, d_model)          # день недели
-            self.adj_src = nn.Embedding(n_nodes, adj_emb_dim)  # выученный граф:
-            self.adj_dst = nn.Embedding(n_nodes, adj_emb_dim)  # ребро = ⟨e_i, e_j⟩
-            for emb in (self.node_emb, self.tod_emb, self.dow_emb,
-                        self.adj_src, self.adj_dst):
+            for emb in (self.node_emb, self.tod_emb, self.dow_emb):
+                nn.init.normal_(emb.weight, std=0.02)
+        #   Идея 2 — Graph WaveNet / AGCRN: adaptive adjacency (ребро = ⟨e_i, e_j⟩).
+        if use_adaptive_adj:
+            self.adj_src = nn.Embedding(n_nodes, adj_emb_dim)
+            self.adj_dst = nn.Embedding(n_nodes, adj_emb_dim)
+            for emb in (self.adj_src, self.adj_dst):
                 nn.init.normal_(emb.weight, std=0.02)
 
         # FiLM-кондиционирование на статики узла; нулевая инициализация —
@@ -468,7 +488,8 @@ class GATForecaster(nn.Module):
                 node_idx=None, neigh_idx=None, enc_tod=None, enc_dow=None,
                 dec_tod=None, dec_dow=None):
         B, K, T, Fin = neigh_x.shape
-        adaptive = self.use_adaptive and node_idx is not None
+        embed = self.use_adaptive_embed and node_idx is not None   # идея 1
+        adj = self.use_adaptive_adj and node_idx is not None       # идея 2
 
         h_self = self.encoder(enc_x) + self.pos_emb[:, :T]
         gamma, beta = self.stat_film(node_stat).chunk(2, dim=-1)
@@ -477,7 +498,7 @@ class GATForecaster(nn.Module):
         h_neigh = self.encoder(neigh_x.reshape(B * K, T, Fin)) + self.pos_emb[:, :T]
         h_neigh = h_neigh.reshape(B, K, T, self.d_model)
 
-        if adaptive:
+        if embed:
             tod_e = self.tod_emb(enc_tod) + self.dow_emb(enc_dow)    # [B, T, d]
             node_e = self.node_emb(node_idx)                         # [B, d]
             h_self = h_self + node_e.unsqueeze(1) + tod_e
@@ -488,7 +509,7 @@ class GATForecaster(nn.Module):
 
         h0 = torch.tanh(self.h0_proj(h_self[:, -1])).unsqueeze(0).contiguous()
         dec_in = self.dec_embed(dec_x)
-        if adaptive:
+        if embed:
             dec_te = self.tod_emb(dec_tod) + self.dow_emb(dec_dow)   # [B, H, d]
             dec_in = dec_in + node_e.unsqueeze(1) + dec_te
         dec_h, _ = self.dec_gru(dec_in, h0)                          # [B, H, d]
@@ -496,7 +517,7 @@ class GATForecaster(nn.Module):
         x = self.norm1(dec_h + self.drop(self.temporal_attn(dec_h, h_self)))
 
         bias = self.edge_scale * edge_w                              # [B, K]
-        if adaptive:
+        if adj:
             a_src = self.adj_src(node_idx)                           # [B, da]
             a_dst = self.adj_dst(neigh_idx)                          # [B, K, da]
             bias = bias + (a_src.unsqueeze(1) * a_dst).sum(-1) / math.sqrt(self.adj_emb_dim)
@@ -529,8 +550,12 @@ class GATTrainConfig:
     dropout: float = 0.1
     neighbor_dropout: float = 0.15
     night_weight: float = 0.3
-    use_adaptive: bool = True
+    use_adaptive_embed: bool = True
+    use_adaptive_adj: bool = True
     adj_emb_dim: int = 16
+    bidirectional_encoder: bool = False
+    pretrain_epochs: int = 0
+    pretrain_mask_ratio: float = 0.4
     epochs: int = 12
     batch_size: int = 256
     learning_rate: float = 1e-3
@@ -541,6 +566,45 @@ class GATTrainConfig:
     device: str = "auto"
     seed: int = 42
     amp: bool = True
+
+
+# ── Self-supervised предобучение энкодера ─────────────────────────────────────
+#
+# STD-MAE (2024) / GPT-ST (NeurIPS'23): прежде чем учить прогноз, предобучаем
+# общий каузальный энкодер на задаче masked-reconstruction. Маскируем долю
+# временных шагов канала значения и восстанавливаем их — это плотный
+# self-supervised сигнал (каждый замаскированный шаг = цель) из ВСЕХ окон,
+# включая синтетику. На 168 ч данных supervised-обучение такой сигнал извлечь
+# не может: у него лишь по одному прогнозному таргету на окно.
+
+def pretrain_encoder(encoder, loader, device, epochs, mask_ratio, lr, amp):
+    d_model = encoder.input_proj.out_channels
+    recon_head = nn.Linear(d_model, 1).to(device)
+    params = list(encoder.parameters()) + list(recon_head.parameters())
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    encoder.train()
+    for epoch in range(1, epochs + 1):
+        total, n = 0.0, 0
+        for batch in loader:
+            enc_x = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
+            B = enc_x.shape[0]
+            target = enc_x[:, :, 0].clone()                       # норм. значения [B,T]
+            mask = torch.rand_like(target) < mask_ratio
+            masked = enc_x.clone()
+            masked[:, :, 0] = target.masked_fill(mask, 0.0)       # маскируем только значение
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=amp):
+                recon = recon_head(encoder(masked)).squeeze(-1)   # [B,T]
+                mse = ((recon - target) ** 2 * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+            scaler.scale(mse).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(params, max_norm=1.0)
+            scaler.step(opt)
+            scaler.update()
+            total += float(mse.item()) * B
+            n += B
+        print(f"  pretrain epoch={epoch}/{epochs} recon_mse={total / max(n, 1):.5f}")
 
 
 # ── Обучение ──────────────────────────────────────────────────────────────────
@@ -596,12 +660,26 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
         dropout=cfg.dropout,
         neighbor_dropout=cfg.neighbor_dropout,
         n_nodes=len(object_ids),
-        use_adaptive=cfg.use_adaptive,
+        use_adaptive_embed=cfg.use_adaptive_embed,
+        use_adaptive_adj=cfg.use_adaptive_adj,
         adj_emb_dim=cfg.adj_emb_dim,
+        bidirectional_encoder=cfg.bidirectional_encoder,
     ).to(device)
 
     if pretrained_model is not None:
         model.load_state_dict(pretrained_model.state_dict())
+
+    # Стадия 1: masked-предобучение общего энкодера (STD-MAE/GPT-ST).
+    # Пропускаем при дообучении из готовой модели (энкодер уже тёплый).
+    if cfg.pretrain_epochs > 0 and pretrained_model is None:
+        print(f"GAT h={horizon}: masked-предобучение энкодера "
+              f"({cfg.pretrain_epochs} эпох, mask_ratio={cfg.pretrain_mask_ratio})")
+        pretrain_encoder(
+            model.encoder, loader, device, cfg.pretrain_epochs,
+            cfg.pretrain_mask_ratio, cfg.learning_rate,
+            cfg.amp and device.type == "cuda",
+        )
+        model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 

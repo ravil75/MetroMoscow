@@ -51,7 +51,7 @@ assert len(history) == 2 and np.isfinite(history[-1]["loss"])
 print("train OK (adaptive), loss:", [round(h["loss"], 4) for h in history])
 
 # 3b. Baseline-режим (--no-adaptive) тоже должен работать
-cfg_base = GATTrainConfig(epochs=1, batch_size=64, top_k_neighbors=4, device="cpu", amp=False, num_workers=0, use_adaptive=False)
+cfg_base = GATTrainConfig(epochs=1, batch_size=64, top_k_neighbors=4, device="cpu", amp=False, num_workers=0, use_adaptive_embed=False, use_adaptive_adj=False)
 model_base, _, hist_base = train_gat(pivot.iloc[:120], None, 24, cfg_base, graph)
 assert np.isfinite(hist_base[-1]["loss"])
 print("train OK (baseline, no-adaptive), loss:", round(hist_base[-1]["loss"], 4))
