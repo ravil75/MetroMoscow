@@ -175,6 +175,8 @@ def save_gat_checkpoint(model, scales, cfg, graph, filepath):
         "use_adaptive_adj": model.use_adaptive_adj,
         "adj_emb_dim": model.adj_emb_dim,
         "bidirectional_encoder": model.bidirectional_encoder,
+        "use_san": model.use_san,
+        "san_period": model.san_period,
         "graph": graph,
     }
     torch.save(checkpoint, filepath)
@@ -206,6 +208,8 @@ def load_gat_checkpoint(filepath, device="auto"):
         use_adaptive_adj=checkpoint.get("use_adaptive_adj", checkpoint.get("use_adaptive", False)),
         adj_emb_dim=checkpoint.get("adj_emb_dim", 16),
         bidirectional_encoder=checkpoint.get("bidirectional_encoder", False),
+        use_san=checkpoint.get("use_san", False),
+        san_period=checkpoint.get("san_period", 24),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -409,6 +413,47 @@ class CrossAttention(nn.Module):
         return self.out_proj(out)
 
 
+# ── SAN: Slice Adaptive Normalization (NeurIPS'23) ────────────────────────────
+#
+# Нестационарность снимается на уровне локальных слайсов (суток), а не всего окна:
+# каждый слайс нормируется своими (μ, σ), а лёгкий модуль предсказывает статистики
+# будущих слайсов для денормализации прогноза. Лечит дрейф уровня между фолдами
+# (наш fold1), которого статический per-object scale не видит. Не нужен внешний
+# корпус — учится на тех же данных. Выходы предсказателей инициализированы нулём
+# → старт с «персистентности статистик» (безопасно, без cold-start взрыва).
+
+class SAN(nn.Module):
+    def __init__(self, period, past_window, horizon, d_hidden=64):
+        super().__init__()
+        assert past_window % period == 0, "past_window должен делиться на san_period"
+        self.period = period
+        self.n_past = past_window // period
+        self.n_fut = max(1, math.ceil(horizon / period))
+        in_dim = self.n_past * 2
+        self.mean_pred = nn.Sequential(nn.Linear(in_dim, d_hidden), nn.GELU(), nn.Linear(d_hidden, self.n_fut))
+        self.std_pred = nn.Sequential(nn.Linear(in_dim, d_hidden), nn.GELU(), nn.Linear(d_hidden, self.n_fut))
+        for head in (self.mean_pred, self.std_pred):
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+        self.register_buffer("step_slice", (torch.arange(horizon) // period).clamp_max(self.n_fut - 1))
+
+    def slice_norm(self, v):
+        # v: [..., T] (T = n_past*period) → послайсовая нормировка
+        lead = v.shape[:-1]
+        sl = v.reshape(*lead, self.n_past, self.period)
+        mu = sl.mean(-1, keepdim=True)
+        sd = sl.std(-1, keepdim=True).clamp_min(1e-5)
+        v_norm = ((sl - mu) / sd).reshape(*lead, self.n_past * self.period)
+        return v_norm, mu.squeeze(-1), sd.squeeze(-1)        # mu, sd: [..., n_past]
+
+    def future_stats(self, mu, sd):
+        # mu, sd: [B, n_past] → предсказанные статистики на каждый шаг горизонта
+        stats = torch.cat([mu, sd], dim=-1)
+        fut_mu = mu[:, -1:] + self.mean_pred(stats)          # резидуал на персистентность
+        fut_sd = (sd[:, -1:] + self.std_pred(stats)).clamp_min(1e-4)
+        return fut_mu[:, self.step_slice], fut_sd[:, self.step_slice]   # [B, H]
+
+
 # ── EgoGAT Forecaster ─────────────────────────────────────────────────────────
 #
 # Общий темпоральный энкодер для цели и соседей + per-step декодер:
@@ -423,7 +468,7 @@ class GATForecaster(nn.Module):
         n_heads=4, n_neighbors=8, past_window=72, horizon=24,
         dropout=0.1, neighbor_dropout=0.15, n_nodes=1,
         use_adaptive_embed=True, use_adaptive_adj=True, adj_emb_dim=16,
-        bidirectional_encoder=False,
+        bidirectional_encoder=False, use_san=False, san_period=24,
     ):
         super().__init__()
         self.in_features = in_features
@@ -439,6 +484,9 @@ class GATForecaster(nn.Module):
         self.use_adaptive_adj = use_adaptive_adj
         self.adj_emb_dim = adj_emb_dim
         self.bidirectional_encoder = bidirectional_encoder
+        self.use_san = use_san
+        self.san_period = san_period
+        self.san = SAN(san_period, past_window, horizon) if use_san else None
 
         self.encoder = TemporalEncoder(in_features, d_model, dropout, causal=not bidirectional_encoder)
         self.pos_emb = nn.Parameter(torch.zeros(1, past_window, d_model))
@@ -497,6 +545,17 @@ class GATForecaster(nn.Module):
         embed = self.use_adaptive_embed and node_idx is not None   # идея 1
         adj = self.use_adaptive_adj and node_idx is not None       # идея 2
 
+        # SAN: послайсовая нормировка value-каналов цели и соседей + предсказание
+        # будущих статистик. Выход денормализуется в самом конце forward.
+        san_mu = san_sd = None
+        if self.use_san:
+            v_enc, mu_p, sd_p = self.san.slice_norm(enc_x[..., 0])     # [B, T]
+            san_mu, san_sd = self.san.future_stats(mu_p, sd_p)         # [B, H]
+            enc_x = enc_x.clone(); enc_x[..., 0] = v_enc
+            v_nb, _, _ = self.san.slice_norm(neigh_x[..., 0])          # [B, K, T]
+            neigh_x = neigh_x.clone(); neigh_x[..., 0] = v_nb
+            dec_x = dec_x.clone(); dec_x[..., 0] = (dec_x[..., 0] - san_mu) / san_sd
+
         h_self = self.encoder(enc_x) + self.pos_emb[:, :T]
         gamma, beta = self.stat_film(node_stat).chunk(2, dim=-1)
         h_self = h_self * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
@@ -541,7 +600,10 @@ class GATForecaster(nn.Module):
 
         # Выход = сезонная наивка + предсказанная поправка
         delta = self.out_proj(self.out_grn(x)).squeeze(-1)           # [B, H]
-        return dec_x[..., 0] + delta
+        out = dec_x[..., 0] + delta
+        if self.use_san:                                             # денормализация SAN
+            out = out * san_sd + san_mu
+        return out
 
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
@@ -560,6 +622,8 @@ class GATTrainConfig:
     use_adaptive_adj: bool = True
     adj_emb_dim: int = 16
     bidirectional_encoder: bool = False
+    use_san: bool = False
+    san_period: int = 24
     pretrain_epochs: int = 0
     pretrain_mask_ratio: float = 0.4
     epochs: int = 12
@@ -670,6 +734,8 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
         use_adaptive_adj=cfg.use_adaptive_adj,
         adj_emb_dim=cfg.adj_emb_dim,
         bidirectional_encoder=cfg.bidirectional_encoder,
+        use_san=cfg.use_san,
+        san_period=cfg.san_period,
     ).to(device)
 
     if pretrained_model is not None:

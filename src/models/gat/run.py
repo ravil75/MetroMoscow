@@ -84,6 +84,15 @@ def parse_args():
              "при masked-предобучении; история полностью наблюдаема — leak'а нет.",
     )
     parser.add_argument(
+        "--san", action="store_true",
+        help="Slice Adaptive Normalization (NeurIPS'23): послайсовая нормировка + "
+             "предсказание будущих статистик. Лечит нестационарность/дрейф уровня.",
+    )
+    parser.add_argument(
+        "--san-period", type=int, default=24,
+        help="Длина слайса SAN в часах (по умолчанию суточный цикл).",
+    )
+    parser.add_argument(
         "--pretrain-epochs", type=int, default=0,
         help="Эпохи masked-предобучения энкодера (STD-MAE'24 / GPT-ST'23). 0 = выкл.",
     )
@@ -137,6 +146,8 @@ def main():
         use_adaptive_embed=not (args.no_adaptive or args.no_adaptive_embed),
         use_adaptive_adj=not (args.no_adaptive or args.no_adaptive_adj),
         bidirectional_encoder=args.bidirectional_encoder,
+        use_san=args.san,
+        san_period=args.san_period,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_mask_ratio=args.pretrain_mask_ratio,
         epochs=args.epochs,
