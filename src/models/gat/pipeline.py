@@ -177,6 +177,9 @@ def save_gat_checkpoint(model, scales, cfg, graph, filepath):
         "bidirectional_encoder": model.bidirectional_encoder,
         "use_san": model.use_san,
         "san_period": model.san_period,
+        "use_timesnet": model.use_timesnet,
+        "timesnet_blocks": model.timesnet_blocks,
+        "timesnet_k": model.timesnet_k,
         "graph": graph,
     }
     torch.save(checkpoint, filepath)
@@ -210,6 +213,9 @@ def load_gat_checkpoint(filepath, device="auto"):
         bidirectional_encoder=checkpoint.get("bidirectional_encoder", False),
         use_san=checkpoint.get("use_san", False),
         san_period=checkpoint.get("san_period", 24),
+        use_timesnet=checkpoint.get("use_timesnet", False),
+        timesnet_blocks=checkpoint.get("timesnet_blocks", 2),
+        timesnet_k=checkpoint.get("timesnet_k", 2),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -384,6 +390,81 @@ class TemporalEncoder(nn.Module):
         return h.transpose(1, 2)                    # [B, T, d]
 
 
+# ── TimesNet энкодер (ICLR'23, arXiv 2210.02186) ──────────────────────────────
+#
+# FFT находит топ-k доминирующих периодов; 1D-ряд разворачивается в 2D
+# (внутрипериодные вариации × межпериодные), и Inception-2D-свёртки моделируют
+# обе оси. Для часовых данных доминирующий период = 24 → 2D-структура
+# «часы × сутки», что точнее одномерного dilated-conv ловит суточную форму.
+# История полностью наблюдаема, поэтому энкодер некаузальный (как и в статье).
+
+def _fft_top_periods(x, k):
+    # x: [B, T, d] → топ-k периодов по амплитуде спектра + их веса
+    T = x.shape[1]
+    amp = torch.fft.rfft(x, dim=1).abs().mean(dim=(0, 2))    # [T//2+1]
+    amp[0] = 0.0                                             # убрать DC-компоненту
+    k = min(k, amp.shape[0] - 1)
+    top = torch.topk(amp, k).indices
+    periods = [max(int(T // f.item()), 2) for f in top.clamp(min=1)]
+    return periods, amp[top]
+
+
+class _Inception2d(nn.Module):
+    """Параметр-эффективный набор 2D-свёрток разных ядер (как в TimesNet)."""
+    def __init__(self, d_in, d_out, num_kernels=4):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Conv2d(d_in, d_out, kernel_size=2 * i + 1, padding=i)
+            for i in range(num_kernels)
+        ])
+
+    def forward(self, x):
+        return sum(conv(x) for conv in self.convs) / len(self.convs)
+
+
+class TimesBlock(nn.Module):
+    def __init__(self, d_model, k_periods=2, num_kernels=4):
+        super().__init__()
+        self.k = k_periods
+        d_ff = d_model * 2
+        self.inception = nn.Sequential(
+            _Inception2d(d_model, d_ff, num_kernels), nn.GELU(),
+            _Inception2d(d_ff, d_model, num_kernels),
+        )
+
+    def forward(self, x):                           # x: [B, T, d]
+        B, T, d = x.shape
+        periods, weights = _fft_top_periods(x, self.k)
+        outs = []
+        for p in periods:
+            pad = (p - T % p) % p
+            xp = F.pad(x, (0, 0, 0, pad)) if pad else x
+            n = (T + pad) // p
+            xp = xp.reshape(B, n, p, d).permute(0, 3, 1, 2)     # [B, d, n, p]
+            xp = self.inception(xp)
+            xp = xp.permute(0, 2, 3, 1).reshape(B, (T + pad), d)[:, :T]
+            outs.append(xp)
+        out = torch.stack(outs, dim=-1)                         # [B, T, d, k]
+        w = torch.softmax(weights, dim=0).view(1, 1, 1, -1)
+        return x + (out * w).sum(-1)                            # residual
+
+
+class TimesNetEncoder(nn.Module):
+    """Drop-in замена TemporalEncoder: [B, T, F] → [B, T, d_model]."""
+    def __init__(self, in_features, d_model, dropout=0.1, n_blocks=2, k_periods=2):
+        super().__init__()
+        self.input_proj = nn.Linear(in_features, d_model)
+        self.blocks = nn.ModuleList([TimesBlock(d_model, k_periods) for _ in range(n_blocks)])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_blocks)])
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):                           # [B, T, F]
+        h = self.input_proj(x)
+        for blk, norm in zip(self.blocks, self.norms):
+            h = norm(self.drop(blk(h)))
+        return h                                    # [B, T, d]
+
+
 class CrossAttention(nn.Module):
     """Scaled dot-product cross-attention: запросно-зависимое внимание
     (в отличие от статического GATv1-скоринга a_src·h_i + a_dst·h_j)."""
@@ -469,6 +550,7 @@ class GATForecaster(nn.Module):
         dropout=0.1, neighbor_dropout=0.15, n_nodes=1,
         use_adaptive_embed=True, use_adaptive_adj=True, adj_emb_dim=16,
         bidirectional_encoder=False, use_san=False, san_period=24,
+        use_timesnet=False, timesnet_blocks=2, timesnet_k=2,
     ):
         super().__init__()
         self.in_features = in_features
@@ -487,8 +569,15 @@ class GATForecaster(nn.Module):
         self.use_san = use_san
         self.san_period = san_period
         self.san = SAN(san_period, past_window, horizon) if use_san else None
+        self.use_timesnet = use_timesnet
+        self.timesnet_blocks = timesnet_blocks
+        self.timesnet_k = timesnet_k
 
-        self.encoder = TemporalEncoder(in_features, d_model, dropout, causal=not bidirectional_encoder)
+        if use_timesnet:
+            self.encoder = TimesNetEncoder(in_features, d_model, dropout,
+                                           n_blocks=timesnet_blocks, k_periods=timesnet_k)
+        else:
+            self.encoder = TemporalEncoder(in_features, d_model, dropout, causal=not bidirectional_encoder)
         self.pos_emb = nn.Parameter(torch.zeros(1, past_window, d_model))
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
 
@@ -624,6 +713,9 @@ class GATTrainConfig:
     bidirectional_encoder: bool = False
     use_san: bool = False
     san_period: int = 24
+    use_timesnet: bool = False
+    timesnet_blocks: int = 2
+    timesnet_k: int = 2
     pretrain_epochs: int = 0
     pretrain_mask_ratio: float = 0.4
     epochs: int = 12
@@ -736,6 +828,9 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
         bidirectional_encoder=cfg.bidirectional_encoder,
         use_san=cfg.use_san,
         san_period=cfg.san_period,
+        use_timesnet=cfg.use_timesnet,
+        timesnet_blocks=cfg.timesnet_blocks,
+        timesnet_k=cfg.timesnet_k,
     ).to(device)
 
     if pretrained_model is not None:

@@ -93,6 +93,15 @@ def parse_args():
         help="Длина слайса SAN в часах (по умолчанию суточный цикл).",
     )
     parser.add_argument(
+        "--timesnet", action="store_true",
+        help="TimesNet-энкодер (ICLR'23): 2D-моделирование мультипериодичности "
+             "вместо dilated-conv. Сильнее ловит суточную/недельную структуру.",
+    )
+    parser.add_argument("--timesnet-blocks", type=int, default=2,
+                        help="Число TimesBlock в TimesNet-энкодере.")
+    parser.add_argument("--timesnet-k", type=int, default=2,
+                        help="Число топ-периодов FFT в TimesNet.")
+    parser.add_argument(
         "--pretrain-epochs", type=int, default=0,
         help="Эпохи masked-предобучения энкодера (STD-MAE'24 / GPT-ST'23). 0 = выкл.",
     )
@@ -148,6 +157,9 @@ def main():
         bidirectional_encoder=args.bidirectional_encoder,
         use_san=args.san,
         san_period=args.san_period,
+        use_timesnet=args.timesnet,
+        timesnet_blocks=args.timesnet_blocks,
+        timesnet_k=args.timesnet_k,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_mask_ratio=args.pretrain_mask_ratio,
         epochs=args.epochs,
