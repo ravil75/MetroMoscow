@@ -399,9 +399,11 @@ class TemporalEncoder(nn.Module):
 # История полностью наблюдаема, поэтому энкодер некаузальный (как и в статье).
 
 def _fft_top_periods(x, k):
-    # x: [B, T, d] → топ-k периодов по амплитуде спектра + их веса
+    # x: [B, T, d] → топ-k периодов по амплитуде спектра + их веса.
+    # FFT в fp32: cuFFT в half поддерживает только размеры-степени-2 (T=72 — нет),
+    # а для поиска периодов точность fp16 и не нужна.
     T = x.shape[1]
-    amp = torch.fft.rfft(x, dim=1).abs().mean(dim=(0, 2))    # [T//2+1]
+    amp = torch.fft.rfft(x.float(), dim=1).abs().mean(dim=(0, 2))    # [T//2+1]
     amp[0] = 0.0                                             # убрать DC-компоненту
     k = min(k, amp.shape[0] - 1)
     top = torch.topk(amp, k).indices
