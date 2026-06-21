@@ -180,6 +180,9 @@ def save_gat_checkpoint(model, scales, cfg, graph, filepath):
         "use_timesnet": model.use_timesnet,
         "timesnet_blocks": model.timesnet_blocks,
         "timesnet_k": model.timesnet_k,
+        "use_timemixer": model.use_timemixer,
+        "timemixer_scales": model.timemixer_scales,
+        "timemixer_blocks": model.timemixer_blocks,
         "graph": graph,
     }
     torch.save(checkpoint, filepath)
@@ -216,6 +219,9 @@ def load_gat_checkpoint(filepath, device="auto"):
         use_timesnet=checkpoint.get("use_timesnet", False),
         timesnet_blocks=checkpoint.get("timesnet_blocks", 2),
         timesnet_k=checkpoint.get("timesnet_k", 2),
+        use_timemixer=checkpoint.get("use_timemixer", False),
+        timemixer_scales=checkpoint.get("timemixer_scales", 3),
+        timemixer_blocks=checkpoint.get("timemixer_blocks", 2),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -467,6 +473,81 @@ class TimesNetEncoder(nn.Module):
         return h                                    # [B, T, d]
 
 
+# ── TimeMixer энкодер (ICLR'24, arXiv 2405.14616) ─────────────────────────────
+#
+# Мультимасштабное разложение: ряд даунсэмплится в несколько разрешений (тонкое
+# ловит сезонные детали, грубое — тренд). Past-Decomposable-Mixing раскладывает
+# каждый масштаб на сезон+тренд и смешивает между масштабами: сезон снизу-вверх
+# (тонкий→грубый), тренд сверху-вниз (грубый→тонкий). Полностью MLP, дешевле
+# TimesNet (без FFT и 2D-свёрток).
+
+def _resize_time(x, length):                        # [B, T, d] → [B, length, d]
+    if x.shape[1] == length:
+        return x
+    return F.interpolate(x.transpose(1, 2), size=length, mode="linear",
+                         align_corners=False).transpose(1, 2)
+
+
+class _SeriesDecomp(nn.Module):
+    """Разложение на тренд (скользящее среднее) и сезон (остаток)."""
+    def __init__(self, kernel=13):
+        super().__init__()
+        self.kernel = kernel
+
+    def forward(self, x):                           # [B, T, d]
+        T = x.shape[1]
+        k = max(3, min(self.kernel, T if T % 2 else T - 1))
+        pad = k // 2
+        xt = F.pad(x.transpose(1, 2), (pad, pad), mode="replicate")
+        trend = F.avg_pool1d(xt, k, stride=1).transpose(1, 2)[:, :T]
+        return x - trend, trend                     # сезон, тренд
+
+
+class PDMBlock(nn.Module):
+    def __init__(self, d_model, n_scales, kernel, dropout):
+        super().__init__()
+        self.decomp = _SeriesDecomp(kernel)
+        self.season_mix = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_scales - 1)])
+        self.trend_mix = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_scales - 1)])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_scales)])
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, scales):
+        n = len(scales)
+        seasons, trends = [], []
+        for s in scales:
+            se, tr = self.decomp(s)
+            seasons.append(se)
+            trends.append(tr)
+        for i in range(n - 1):                       # сезон: тонкий → грубый
+            up = _resize_time(seasons[i], seasons[i + 1].shape[1])
+            seasons[i + 1] = seasons[i + 1] + self.drop(self.season_mix[i](up))
+        for i in range(n - 1, 0, -1):                # тренд: грубый → тонкий
+            down = _resize_time(trends[i], trends[i - 1].shape[1])
+            trends[i - 1] = trends[i - 1] + self.drop(self.trend_mix[i - 1](down))
+        return [self.norms[i](scales[i] + seasons[i] + trends[i]) for i in range(n)]
+
+
+class TimeMixerEncoder(nn.Module):
+    """Drop-in замена TemporalEncoder: [B, T, F] → [B, T, d_model] (тонкий масштаб)."""
+    def __init__(self, in_features, d_model, dropout=0.1, n_scales=3, n_blocks=2, decomp_kernel=13):
+        super().__init__()
+        self.n_scales = n_scales
+        self.input_proj = nn.Linear(in_features, d_model)
+        self.blocks = nn.ModuleList([PDMBlock(d_model, n_scales, decomp_kernel, dropout) for _ in range(n_blocks)])
+
+    def forward(self, x):                           # [B, T, F]
+        h = self.input_proj(x)
+        scales = [h]
+        for _ in range(1, self.n_scales):
+            if scales[-1].shape[1] < 4:
+                break
+            scales.append(F.avg_pool1d(scales[-1].transpose(1, 2), 2).transpose(1, 2))
+        for block in self.blocks:
+            scales = block(scales)
+        return scales[0]                            # [B, T, d]
+
+
 class CrossAttention(nn.Module):
     """Scaled dot-product cross-attention: запросно-зависимое внимание
     (в отличие от статического GATv1-скоринга a_src·h_i + a_dst·h_j)."""
@@ -553,6 +634,7 @@ class GATForecaster(nn.Module):
         use_adaptive_embed=True, use_adaptive_adj=True, adj_emb_dim=16,
         bidirectional_encoder=False, use_san=False, san_period=24,
         use_timesnet=False, timesnet_blocks=2, timesnet_k=2,
+        use_timemixer=False, timemixer_scales=3, timemixer_blocks=2,
     ):
         super().__init__()
         self.in_features = in_features
@@ -574,10 +656,16 @@ class GATForecaster(nn.Module):
         self.use_timesnet = use_timesnet
         self.timesnet_blocks = timesnet_blocks
         self.timesnet_k = timesnet_k
+        self.use_timemixer = use_timemixer
+        self.timemixer_scales = timemixer_scales
+        self.timemixer_blocks = timemixer_blocks
 
         if use_timesnet:
             self.encoder = TimesNetEncoder(in_features, d_model, dropout,
                                            n_blocks=timesnet_blocks, k_periods=timesnet_k)
+        elif use_timemixer:
+            self.encoder = TimeMixerEncoder(in_features, d_model, dropout,
+                                            n_scales=timemixer_scales, n_blocks=timemixer_blocks)
         else:
             self.encoder = TemporalEncoder(in_features, d_model, dropout, causal=not bidirectional_encoder)
         self.pos_emb = nn.Parameter(torch.zeros(1, past_window, d_model))
@@ -718,6 +806,9 @@ class GATTrainConfig:
     use_timesnet: bool = False
     timesnet_blocks: int = 2
     timesnet_k: int = 2
+    use_timemixer: bool = False
+    timemixer_scales: int = 3
+    timemixer_blocks: int = 2
     pretrain_epochs: int = 0
     pretrain_mask_ratio: float = 0.4
     epochs: int = 12
@@ -833,6 +924,9 @@ def train_gat(train_real, synthetic_train, horizon, cfg, graph, pretrained_model
         use_timesnet=cfg.use_timesnet,
         timesnet_blocks=cfg.timesnet_blocks,
         timesnet_k=cfg.timesnet_k,
+        use_timemixer=cfg.use_timemixer,
+        timemixer_scales=cfg.timemixer_scales,
+        timemixer_blocks=cfg.timemixer_blocks,
     ).to(device)
 
     if pretrained_model is not None:

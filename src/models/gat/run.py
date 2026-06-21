@@ -102,6 +102,15 @@ def parse_args():
     parser.add_argument("--timesnet-k", type=int, default=2,
                         help="Число топ-периодов FFT в TimesNet.")
     parser.add_argument(
+        "--timemixer", action="store_true",
+        help="TimeMixer-энкодер (ICLR'24): мультимасштабное разложение сезон/тренд "
+             "вместо dilated-conv. Дешевле TimesNet (MLP). Взаимоисключим с --timesnet.",
+    )
+    parser.add_argument("--timemixer-scales", type=int, default=3,
+                        help="Число масштабов даунсэмплинга в TimeMixer.")
+    parser.add_argument("--timemixer-blocks", type=int, default=2,
+                        help="Число PDM-блоков в TimeMixer.")
+    parser.add_argument(
         "--pretrain-epochs", type=int, default=0,
         help="Эпохи masked-предобучения энкодера (STD-MAE'24 / GPT-ST'23). 0 = выкл.",
     )
@@ -160,6 +169,9 @@ def main():
         use_timesnet=args.timesnet,
         timesnet_blocks=args.timesnet_blocks,
         timesnet_k=args.timesnet_k,
+        use_timemixer=args.timemixer,
+        timemixer_scales=args.timemixer_scales,
+        timemixer_blocks=args.timemixer_blocks,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_mask_ratio=args.pretrain_mask_ratio,
         epochs=args.epochs,
