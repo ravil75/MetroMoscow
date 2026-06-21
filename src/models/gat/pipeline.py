@@ -811,6 +811,10 @@ class GATTrainConfig:
     timemixer_blocks: int = 2
     pretrain_epochs: int = 0
     pretrain_mask_ratio: float = 0.4
+    ensemble: int = 1
+    save_predictions: bool = False
+    pred_tag: str = ""
+    hierarchy: bool = False
     epochs: int = 12
     batch_size: int = 256
     learning_rate: float = 1e-3
@@ -1208,6 +1212,20 @@ def run_gat_backtest(
     object_ids = list(pivot_df.columns[:max_objects]) if max_objects else list(pivot_df.columns)
     pivot_df = pivot_df[object_ids]
 
+    # Иерархия: добавляем агрегатные ряды (кластер-суммы + итог), чтобы модель
+    # форкастила их независимо → потом MinT-согласование (reconcile.py).
+    hierarchy_on = getattr(cfg, "hierarchy", False)
+    station_ids = list(object_ids)
+    if hierarchy_on:
+        from .hierarchy import load_cluster_map, augment_with_aggregates, AGG_PREFIX
+        cluster_map = load_cluster_map(object_ids)
+        pivot_df = augment_with_aggregates(pivot_df, cluster_map)
+        object_ids = list(pivot_df.columns)
+        cfg = replace(cfg, save_predictions=True)
+        n_agg = len(object_ids) - len(station_ids)
+        print(f"GAT иерархия: +{n_agg} агрегатных рядов (кластеры+итог); "
+              f"метрики по {len(station_ids)} станциям, прогнозы агрегатов для MinT")
+
     prepended_synth = None
     if "real_plus_synth" in train_modes:
         from ...synthesis import prepend_synthetic_week
@@ -1220,7 +1238,10 @@ def run_gat_backtest(
     if not folds:
         raise ValueError(f"Not enough folds for GAT horizon={horizon}.")
 
-    rows, histories, synth_validation_rows = [], [], []
+    rows, histories, synth_validation_rows, pred_rows = [], [], [], []
+    n_members = max(1, int(getattr(cfg, "ensemble", 1)))
+    if n_members > 1:
+        print(f"GAT ансамбль: {n_members} сидов на фолд, усреднение прогнозов")
 
     for fold in folds:
         real_train_slice = pivot_df.iloc[fold["train_start"]:fold["train_end"]]
@@ -1233,7 +1254,10 @@ def run_gat_backtest(
             synth_validation_rows.append(val)
 
         graph = build_graph(real_train_slice, cfg.top_k_neighbors, cfg.min_corr)
-        active_objects = get_active_objects(real_train_slice, object_ids)
+        # В иерархии метрики по ВСЕМ станциям (агрегаты только для согласования);
+        # иначе — по активным объектам, как обычно.
+        active_objects = station_ids if hierarchy_on else get_active_objects(real_train_slice, object_ids)
+        active_set = set(active_objects)
 
         for train_mode in train_modes:
             if train_mode == "real_plus_synth" and prepended_synth is not None:
@@ -1248,33 +1272,55 @@ def run_gat_backtest(
                 train_real = real_train_slice
                 fold_synth = None
 
-            if train_mode == "real_plus_synth":
-                model, scales, history = train_gat_two_phase(
-                    train_real, fold_synth, horizon, cfg, graph, scale_source=real_train_slice
+            member_preds = []
+            for member in range(n_members):
+                m_cfg = cfg if n_members == 1 else replace(cfg, seed=cfg.seed + 101 * member)
+                if train_mode == "real_plus_synth":
+                    model, scales, history = train_gat_two_phase(
+                        train_real, fold_synth, horizon, m_cfg, graph, scale_source=real_train_slice
+                    )
+                else:
+                    model, scales, history = train_gat(
+                        real_train_slice, None, horizon, m_cfg, graph, scale_source=real_train_slice
+                    )
+                member_preds.append(
+                    predict_gat_batch(model, real_train_slice, target_index, scales, m_cfg, graph)
                 )
-            else:
-                model, scales, history = train_gat(
-                    real_train_slice, None, horizon, cfg, graph, scale_source=real_train_slice
-                )
+                if member == 0:
+                    for item in history:
+                        histories.append({**item, "horizon": horizon, "fold": fold["fold"], "train_mode": train_mode, "model": "GAT"})
+                    if fold["fold"] == folds[-1]["fold"]:
+                        model_path = config.OUTPUT_DIR / f"gat_model_rolling_{train_mode}_h{horizon}.pt"
+                        save_gat_checkpoint(model, scales, cfg, graph, model_path)
 
-            if fold["fold"] == folds[-1]["fold"]:
-                model_path = config.OUTPUT_DIR / f"gat_model_rolling_{train_mode}_h{horizon}.pt"
-                save_gat_checkpoint(model, scales, cfg, graph, model_path)
-
-            for item in history:
-                histories.append({**item, "horizon": horizon, "fold": fold["fold"], "train_mode": train_mode, "model": "GAT"})
-
-            pred_df = predict_gat_batch(model, real_train_slice, target_index, scales, cfg, graph)
+            # усреднение прогнозов ансамбля (поэлементно по объектам/времени)
+            pred_df = member_preds[0] if n_members == 1 else sum(member_preds) / n_members
             day_mask = get_day_mask(target_index)
+            ts_day = target_index[day_mask]
+            # в иерархии сохраняем и агрегаты (нужны для MinT), метрики — по станциям
+            iter_ids = object_ids if hierarchy_on else active_objects
 
-            for oid in active_objects:
+            for oid in iter_ids:
                 yt = test_real[oid].values[day_mask]
                 yp = pred_df[oid].values[day_mask]
                 if len(yt) == 0:
                     continue
-                row = forecast_metrics(yt, yp, model_name="GAT", horizon=horizon, train_mode=train_mode, object_id=oid, fold=fold["fold"])
-                row.update({"test_start": target_index[0], "test_end": target_index[-1], "train_hours": len(real_train_slice), "test_data": "real"})
-                rows.append(row)
+                if oid in active_set:                       # метрика только по станциям
+                    row = forecast_metrics(yt, yp, model_name="GAT", horizon=horizon, train_mode=train_mode, object_id=oid, fold=fold["fold"])
+                    row.update({"test_start": target_index[0], "test_end": target_index[-1], "train_hours": len(real_train_slice), "test_data": "real"})
+                    rows.append(row)
+                if cfg.save_predictions:
+                    for k in range(len(yt)):
+                        pred_rows.append({"horizon": horizon, "fold": fold["fold"], "train_mode": train_mode,
+                                          "object_id": oid, "timestamp": ts_day[k],
+                                          "y_true": float(yt[k]), "y_pred": float(yp[k])})
+
+    if cfg.save_predictions and pred_rows:
+        tag = f"_{cfg.pred_tag}" if cfg.pred_tag else ""
+        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        pred_path = config.OUTPUT_DIR / f"gat_predictions_{horizon}h{tag}.csv"
+        pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
+        print(f"saved predictions for blending: {pred_path}")
 
     results = pd.DataFrame(rows)
     if results.empty:

@@ -119,6 +119,25 @@ def parse_args():
         help="Доля маскируемых временных шагов при предобучении.",
     )
 
+    # Ансамбль / блендинг
+    parser.add_argument(
+        "--ensemble", type=int, default=1,
+        help="Число сидов ансамбля на фолд (прогнозы усредняются). 1 = выкл.",
+    )
+    parser.add_argument(
+        "--save-predictions", action="store_true",
+        help="Сохранить прогнозы по (фолд, объект, время) для последующего блендинга.",
+    )
+    parser.add_argument(
+        "--pred-tag", default="",
+        help="Суффикс файла прогнозов (напр. timesnet/dilated), чтобы различать прогоны.",
+    )
+    parser.add_argument(
+        "--hierarchy", action="store_true",
+        help="Иерархия станция→кластер→итог: форкастить агрегаты + сохранить прогнозы "
+             "для MinT-согласования (затем python -m src.models.gat.reconcile <файл>).",
+    )
+
     # Обучение
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument(
@@ -172,6 +191,10 @@ def main():
         use_timemixer=args.timemixer,
         timemixer_scales=args.timemixer_scales,
         timemixer_blocks=args.timemixer_blocks,
+        ensemble=args.ensemble,
+        save_predictions=args.save_predictions,
+        pred_tag=args.pred_tag,
+        hierarchy=args.hierarchy,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_mask_ratio=args.pretrain_mask_ratio,
         epochs=args.epochs,
