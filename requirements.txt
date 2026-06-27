@@ -1,0 +1,18 @@
+# Зависимости проекта (по импортам в src/ и окружению из GAT_WORK_SUMMARY.md).
+# Версии не зафиксированы: пакеты ставились вручную в WSL venv / присутствуют на Kaggle.
+
+# Ядро: обработка данных и модели
+numpy
+pandas
+pyarrow            # чтение/запись parquet (hourly/object_hourly)
+scipy
+scikit-learn       # кластеризация объектов (src/clustering.py)
+statsmodels        # классические бейзлайны (src/baseline_models.py)
+torch              # модели GAT/TFT/TCN/N-BEATS
+
+# Загрузка датасета
+gdown              # скачивание архива с Google Drive (src/data_prep.py)
+
+# Ноутбуки-отчёты
+matplotlib         # визуализации в notebooks/gat_report_*
+nbconvert          # запуск ноутбуков из CLI
